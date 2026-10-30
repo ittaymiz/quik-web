@@ -1,0 +1,322 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Quik Web – Video Editor</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%23111'/%3E%3Ctext x='32' y='42' font-family='Arial' font-weight='700' font-size='26' fill='%23fff' text-anchor='middle'%3EQ%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div id="app">
+
+  <!-- ===== Header ===== -->
+  <header class="topbar">
+    <div class="brand"><span class="logo">Quik</span><span class="sub">Web</span></div>
+    <input id="projectTitle" class="title-input" placeholder="Untitled project" maxlength="60">
+    <div class="topbar-actions">
+      <select id="aspectSelect" title="Aspect ratio">
+        <option value="16:9">16:9 Landscape</option>
+        <option value="9:16">9:16 Vertical</option>
+        <option value="1:1">1:1 Square</option>
+        <option value="4:5">4:5 Portrait</option>
+      </select>
+      <button id="undoBtn" class="icon-btn" title="Undo (Ctrl+Z)">↶</button>
+      <button id="redoBtn" class="icon-btn" title="Redo (Ctrl+Y)">↷</button>
+      <button id="newProjectBtn" class="ghost-btn" title="Start a new empty project">New</button>
+      <button id="exportBtn" class="primary-btn">Export</button>
+    </div>
+  </header>
+
+  <!-- ===== Main area ===== -->
+  <main class="workspace">
+
+    <!-- Media bin -->
+    <aside class="panel media-panel">
+      <div class="panel-head">
+        <h2>Media</h2>
+        <button id="addMediaBtn" class="small-btn">+ Add</button>
+        <input id="fileInput" type="file" accept="video/*,image/*" multiple hidden>
+      </div>
+      <div id="dropZone" class="drop-zone">
+        <p><strong>Drop videos &amp; photos here</strong><br>or click “+ Add”</p>
+      </div>
+      <div id="mediaGrid" class="media-grid"></div>
+      <div class="panel-foot">
+        <button id="addAllBtn" class="small-btn wide">Add all to timeline</button>
+        <button id="autoCreateBtn" class="primary-btn wide">✨ Auto Create</button>
+      </div>
+    </aside>
+
+    <!-- Preview -->
+    <section class="preview-area">
+      <div class="preview-wrap" id="previewWrap">
+        <canvas id="preview" width="1280" height="720"></canvas>
+        <div id="emptyHint" class="empty-hint">
+          <div class="big">Quik Web</div>
+          <p>Add videos and photos, press <b>Auto Create</b>, then fine-tune every clip.</p>
+        </div>
+      </div>
+      <div class="transport">
+        <button id="toStartBtn" class="icon-btn" title="Go to start (Home)">⏮</button>
+        <button id="playBtn" class="icon-btn play" title="Play / Pause (Space)">▶</button>
+        <button id="toEndBtn" class="icon-btn" title="Go to end (End)">⏭</button>
+        <span id="timeLabel" class="time">00:00.0 / 00:00.0</span>
+        <div class="spacer"></div>
+        <button id="splitBtn" class="small-btn" title="Split selected clip at playhead (S)">✂ Split</button>
+        <button id="frameGrabBtn" class="small-btn" title="Save the current frame as a photo">📷 Frame grab</button>
+        <button id="fullscreenBtn" class="icon-btn" title="Fullscreen preview">⛶</button>
+      </div>
+    </section>
+
+    <!-- Inspector -->
+    <aside class="panel inspector">
+      <nav class="tabs">
+        <button data-tab="clip" class="tab active">Clip</button>
+        <button data-tab="style" class="tab">Style</button>
+        <button data-tab="text" class="tab">Text</button>
+        <button data-tab="music" class="tab">Music</button>
+        <button data-tab="theme" class="tab">Theme</button>
+      </nav>
+
+      <!-- Clip tab -->
+      <section class="tab-page active" data-page="clip">
+        <div id="noClip" class="muted">Select a clip on the timeline to edit it.</div>
+        <div id="clipEditor" hidden>
+          <div class="field-row"><span id="clipName" class="clip-name"></span></div>
+
+          <label class="field-label">Trim</label>
+          <div class="filmstrip" id="filmstrip"></div>
+          <div class="trim-slider" id="trimSlider">
+            <div class="trim-track"></div>
+            <div class="trim-range" id="trimRange"></div>
+            <input type="range" id="trimStart" min="0" max="1000" value="0" step="1">
+            <input type="range" id="trimEnd" min="0" max="1000" value="1000" step="1">
+          </div>
+          <div class="field-row small-text">
+            <span id="trimStartLabel">0.0s</span>
+            <span class="spacer"></span>
+            <span id="trimDurLabel"></span>
+            <span class="spacer"></span>
+            <span id="trimEndLabel">0.0s</span>
+          </div>
+          <div class="field-row">
+            <button id="setInBtn" class="small-btn" title="Set trim start at playhead ([)">[ Set start</button>
+            <button id="setOutBtn" class="small-btn" title="Set trim end at playhead (])">Set end ]</button>
+          </div>
+
+          <div id="imageDurationRow">
+            <label class="field-label">Photo duration <span id="imageDurationLabel"></span></label>
+            <input type="range" id="imageDuration" min="1" max="10" step="0.5" value="3">
+            <label class="check"><input type="checkbox" id="kenBurns"> Ken Burns motion</label>
+          </div>
+
+          <label class="field-label">Speed</label>
+          <div class="seg" id="speedSeg">
+            <button data-speed="0.25">¼×</button>
+            <button data-speed="0.5">½×</button>
+            <button data-speed="1" class="active">1×</button>
+            <button data-speed="2">2×</button>
+            <button data-speed="4">4×</button>
+            <button data-speed="8">8×</button>
+          </div>
+
+          <label class="field-label">Clip volume <span id="volumeLabel">100%</span></label>
+          <input type="range" id="clipVolume" min="0" max="1" step="0.05" value="1">
+
+          <label class="field-label">Transition (into this clip)</label>
+          <select id="transitionType">
+            <option value="none">Cut</option>
+            <option value="crossfade">Crossfade</option>
+            <option value="fade">Fade through black</option>
+            <option value="flash">White flash</option>
+            <option value="slide">Slide</option>
+            <option value="zoom">Zoom</option>
+            <option value="wipe">Wipe</option>
+          </select>
+          <label class="field-label">Transition length <span id="transitionDurLabel"></span></label>
+          <input type="range" id="transitionDur" min="0.2" max="2" step="0.1" value="0.6">
+
+          <label class="field-label">Reframe</label>
+          <div class="seg" id="fitSeg">
+            <button data-fit="cover" class="active">Fill</button>
+            <button data-fit="contain">Fit</button>
+          </div>
+          <label class="field-label">Zoom <span id="zoomLabel"></span></label>
+          <input type="range" id="clipZoom" min="1" max="3" step="0.05" value="1">
+          <label class="field-label">Pan X</label>
+          <input type="range" id="panX" min="-1" max="1" step="0.02" value="0">
+          <label class="field-label">Pan Y</label>
+          <input type="range" id="panY" min="-1" max="1" step="0.02" value="0">
+
+          <div class="field-row">
+            <button id="dupClipBtn" class="small-btn">Duplicate</button>
+            <button id="deleteClipBtn" class="small-btn danger">Delete</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- Style tab -->
+      <section class="tab-page" data-page="style">
+        <div id="noClipStyle" class="muted">Select a clip to style it, or apply a look to every clip.</div>
+        <div id="styleEditor">
+          <label class="field-label">Filter</label>
+          <div class="filter-grid" id="filterGrid"></div>
+          <label class="field-label">Brightness <span id="brightnessLabel"></span></label>
+          <input type="range" id="brightness" min="0.5" max="1.5" step="0.01" value="1">
+          <label class="field-label">Contrast <span id="contrastLabel"></span></label>
+          <input type="range" id="contrast" min="0.5" max="1.5" step="0.01" value="1">
+          <label class="field-label">Saturation <span id="saturationLabel"></span></label>
+          <input type="range" id="saturation" min="0" max="2" step="0.01" value="1">
+          <label class="field-label">Vignette <span id="vignetteLabel"></span></label>
+          <input type="range" id="vignette" min="0" max="1" step="0.05" value="0">
+          <div class="field-row">
+            <button id="applyStyleAllBtn" class="small-btn wide">Apply look to all clips</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- Text tab -->
+      <section class="tab-page" data-page="text">
+        <div id="noClipText" class="muted">Select a clip to add text on it.</div>
+        <div id="textEditor" hidden>
+          <label class="field-label">Text</label>
+          <textarea id="textContent" rows="2" placeholder="Add a title…"></textarea>
+          <label class="field-label">Position</label>
+          <div class="seg" id="textPosSeg">
+            <button data-pos="top">Top</button>
+            <button data-pos="center" class="active">Center</button>
+            <button data-pos="bottom">Bottom</button>
+          </div>
+          <label class="field-label">Style</label>
+          <select id="textStyle">
+            <option value="bold">Bold</option>
+            <option value="outline">Outline</option>
+            <option value="box">Box</option>
+            <option value="lower">Lower third</option>
+            <option value="minimal">Minimal</option>
+          </select>
+          <label class="field-label">Size <span id="textSizeLabel"></span></label>
+          <input type="range" id="textSize" min="0.03" max="0.18" step="0.005" value="0.08">
+          <label class="field-label">Color</label>
+          <div class="field-row">
+            <input type="color" id="textColor" value="#ffffff">
+            <input type="color" id="textAccent" value="#111111" title="Accent / outline color">
+          </div>
+          <label class="field-label">Animation</label>
+          <select id="textAnim">
+            <option value="none">None</option>
+            <option value="fade">Fade in</option>
+            <option value="slideUp">Slide up</option>
+            <option value="pop">Pop</option>
+            <option value="typewriter">Typewriter</option>
+          </select>
+          <label class="field-label">Show for <span id="textDurLabel"></span></label>
+          <input type="range" id="textDur" min="0" max="1" step="0.05" value="1">
+          <div class="small-text muted">0 = whole clip, otherwise share of the clip.</div>
+        </div>
+      </section>
+
+      <!-- Music tab -->
+      <section class="tab-page" data-page="music">
+        <div class="field-row">
+          <button id="addMusicBtn" class="small-btn wide">🎵 Add music track</button>
+          <input id="musicInput" type="file" accept="audio/*" hidden>
+        </div>
+        <div id="musicInfo" class="muted small-text">No music. Add a track to unlock beat sync.</div>
+        <div id="musicEditor" hidden>
+          <label class="field-label">Music volume <span id="musicVolumeLabel"></span></label>
+          <input type="range" id="musicVolume" min="0" max="1" step="0.05" value="0.8">
+          <label class="field-label">Start offset <span id="musicOffsetLabel"></span></label>
+          <input type="range" id="musicOffset" min="0" max="100" step="0.5" value="0">
+          <label class="field-label">Fade in <span id="musicFadeInLabel"></span></label>
+          <input type="range" id="musicFadeIn" min="0" max="5" step="0.5" value="1">
+          <label class="field-label">Fade out <span id="musicFadeOutLabel"></span></label>
+          <input type="range" id="musicFadeOut" min="0" max="5" step="0.5" value="2">
+          <label class="check"><input type="checkbox" id="musicLoop" checked> Loop if shorter than video</label>
+          <label class="check"><input type="checkbox" id="duckVideo" checked> Lower clip audio under music</label>
+          <div class="field-row">
+            <button id="beatSyncBtn" class="small-btn wide">🥁 Sync cuts to beats</button>
+          </div>
+          <div class="field-row">
+            <button id="fitToMusicBtn" class="small-btn wide">Fit video length to music</button>
+          </div>
+          <div class="field-row">
+            <button id="removeMusicBtn" class="small-btn danger wide">Remove music</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- Theme tab -->
+      <section class="tab-page" data-page="theme">
+        <p class="small-text muted">A theme sets the look, the transitions and the pace for the whole edit. Auto Create uses the selected theme.</p>
+        <div class="theme-grid" id="themeGrid"></div>
+        <label class="field-label">Pace</label>
+        <div class="seg" id="paceSeg">
+          <button data-pace="slow">Slow</button>
+          <button data-pace="medium" class="active">Medium</button>
+          <button data-pace="fast">Fast</button>
+        </div>
+        <label class="check"><input type="checkbox" id="themeTitle" checked> Add project title on the first clip</label>
+        <div class="field-row">
+          <button id="applyThemeBtn" class="primary-btn wide">Apply theme to current clips</button>
+        </div>
+        <div class="field-row">
+          <button id="shuffleBtn" class="small-btn wide">🔀 Shuffle order</button>
+        </div>
+      </section>
+    </aside>
+  </main>
+
+  <!-- ===== Timeline ===== -->
+  <footer class="timeline-panel">
+    <div class="timeline-head">
+      <span class="small-text muted">Timeline · drag clips to reorder · click to select · S split · Del delete</span>
+      <div class="spacer"></div>
+      <label class="small-text">Zoom <input type="range" id="tlZoom" min="20" max="200" value="60"></label>
+    </div>
+    <div class="timeline-scroll" id="timelineScroll">
+      <div class="timeline" id="timeline">
+        <div class="ruler" id="ruler"></div>
+        <div class="clips" id="clipsTrack"></div>
+        <div class="music-track" id="musicTrack"></div>
+        <div class="playhead" id="playhead"></div>
+      </div>
+    </div>
+  </footer>
+
+  <!-- ===== Export dialog ===== -->
+  <div id="exportDialog" class="modal" hidden>
+    <div class="modal-card">
+      <h3>Export video</h3>
+      <label class="field-label">Resolution</label>
+      <select id="exportRes">
+        <option value="720">720p</option>
+        <option value="1080" selected>1080p</option>
+      </select>
+      <label class="field-label">Frame rate</label>
+      <select id="exportFps">
+        <option value="30" selected>30 fps</option>
+        <option value="60">60 fps</option>
+      </select>
+      <p class="small-text muted">Rendering happens in your browser in real time, so a 1‑minute video takes about a minute. Keep this tab visible while it renders.</p>
+      <div id="exportProgressWrap" hidden>
+        <div class="progress"><div id="exportProgress" class="progress-bar"></div></div>
+        <div id="exportStatus" class="small-text"></div>
+      </div>
+      <div class="field-row modal-actions">
+        <button id="exportCancelBtn" class="small-btn">Cancel</button>
+        <button id="exportStartBtn" class="primary-btn">Render &amp; download</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast" hidden></div>
+</div>
+
+<script src="js/db.js"></script>
+<script src="js/beats.js"></script>
+<script src="js/presets.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>
