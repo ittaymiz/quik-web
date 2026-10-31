@@ -36,7 +36,7 @@ function toast(msg, ms = 2200) {
    State
    ====================================================================== */
 function newProject() {
-  return { title: '', aspect: '16:9', theme: 'classic', pace: 'medium', themeTitle: true, clips: [], music: null };
+  return { title: '', aspect: '16:9', theme: 'classic', pace: 'medium', themeTitle: true, themeMusic: true, clips: [], music: null };
 }
 function defaultClip(m) {
   return {
@@ -60,7 +60,9 @@ const state = {
   undo: [], redo: [],
   snapCache: new Map(),   // clipId -> canvas holding that clip's final frame (for transitions)
   tlZoom: 60,             // timeline pixels per second
-  activeTab: 'clip'
+  activeTab: 'clip',
+  library: [],            // built-in music tracks (music/library.json)
+  previewId: null         // library track currently previewing
 };
 const P = () => state.project;
 
@@ -153,6 +155,28 @@ function seekTo(el, t) {
   });
 }
 
+function waitFrame(el, ms = 300) {
+  if (!el || typeof el.requestVideoFrameCallback !== 'function') return new Promise(r => setTimeout(r, 30));
+  return new Promise(r => { let done = false; const fin = () => { if (!done) { done = true; r(); } }; el.requestVideoFrameCallback(fin); setTimeout(fin, ms); });
+}
+function isBlack(dataUrl) {
+  // Cheap heuristic: a solid black JPEG compresses to a few hundred bytes.
+  return !dataUrl || dataUrl.length < 1200;
+}
+/* Seeks a (muted) video element to t and returns a thumbnail, working around iOS not painting
+   frames of a video that has never played by nudging it with a muted play/pause. */
+async function grabVideoThumb(el, t, w, h, size = 200) {
+  await seekTo(el, t); await waitFrame(el);
+  let thumb = thumbFrom(el, w, h, size);
+  if (isBlack(thumb) && el.muted) {
+    try { await el.play(); } catch (e) {}
+    await waitFrame(el, 400);
+    el.pause();
+    await seekTo(el, t); await waitFrame(el);
+    thumb = thumbFrom(el, w, h, size);
+  }
+  return thumb;
+}
 function thumbFrom(source, w, h, size = 200) {
   const c = document.createElement('canvas');
   const scale = size / Math.max(w, h);
@@ -191,9 +215,8 @@ async function loadVideoMedia(entry) {
   scratch.preload = 'auto'; scratch.muted = true; scratch.playsInline = true; scratch.setAttribute('muted', ''); scratch.src = entry.url;
   await new Promise(res => { scratch.addEventListener('loadedmetadata', res, { once: true }); scratch.addEventListener('error', res, { once: true }); setTimeout(res, 3000); });
   entry.scratch = scratch;
-  await seekTo(scratch, Math.min(0.5, entry.duration / 2));
-  entry.thumb = thumbFrom(scratch, entry.w, entry.h);
-  if (!entry.thumb || entry.thumb.length < 200) { await seekTo(el, Math.min(0.5, entry.duration / 2)); entry.thumb = thumbFrom(el, entry.w, entry.h); }
+  entry.thumb = await grabVideoThumb(scratch, Math.min(0.5, entry.duration / 2), entry.w, entry.h);
+  if (isBlack(entry.thumb)) entry.thumb = await grabVideoThumb(el, Math.min(0.5, entry.duration / 2), entry.w, entry.h);
   connectAudioEl(el);
 }
 
@@ -291,10 +314,7 @@ async function buildStrip(m) {
   if (m.kind === 'image') { m.strip = [m.thumb]; return m.strip; }
   const n = 8, out = [];
   const el = m.scratch;
-  for (let i = 0; i < n; i++) {
-    await seekTo(el, (i + 0.5) / n * m.duration);
-    out.push(thumbFrom(el, m.w, m.h, 120));
-  }
+  for (let i = 0; i < n; i++) out.push(await grabVideoThumb(el, (i + 0.5) / n * m.duration, m.w, m.h, 120));
   m.strip = out;
   return out;
 }
@@ -601,7 +621,7 @@ async function renderAt(t) {
   let srcEl = null;
   if (loc.clip.kind === 'video' && m) {
     const st = loc.clip.start + loc.lt * loc.clip.speed;
-    await seekTo(m.el, st);
+    await seekTo(m.el, st); await waitFrame(m.el, 120);
     if (token !== renderToken) return;
     if (m.el.readyState < 2 && m.scratch) { await seekTo(m.scratch, st); if (token !== renderToken) return; srcEl = m.scratch; }
   }
@@ -661,6 +681,7 @@ function startMusic(t) {
 
 function play() {
   if (!P().clips.length) { toast('Add some clips first'); return; }
+  stopPreview();
   ensureAudio();
   unlockMedia();
   const total = totalDuration();
@@ -843,9 +864,13 @@ function applyTheme({ retrim = false } = {}) {
   }
   state.snapCache.clear();
 }
-function autoCreate() {
+async function autoCreate() {
   if (!state.media.size) { toast('Add some videos or photos first'); return; }
   pushUndo();
+  if (!P().music && P().themeMusic !== false) {
+    const track = trackForTheme(P().theme);
+    if (track) { toast(`Adding theme music: ${track.name}…`, 20000); await useLibraryTrack(track.id, { silent: true, noUndo: true }); }
+  }
   const pace = PACE[P().pace] || PACE.medium;
   if (!P().clips.length) {
     state.media.forEach(m => {
@@ -860,7 +885,7 @@ function autoCreate() {
   state.playhead = P().clips[0] ? Math.min(P().clips[0].transition.duration, clipDuration(P().clips[0]) / 2) : 0;
   renderAll(); save();
   if (phoneLayout.matches) $('.tab[data-tab="clip"]').click();
-  toast(`Auto-created a ${THEMES[P().theme].name} edit · ${fmt(totalDuration())}`);
+  toast(`Auto-created a ${THEMES[P().theme].name} edit · ${fmt(totalDuration())}${P().music ? ` · ♫ ${P().music.name.replace(/\.mp3$/, '')}` : ''}`, 3500);
 }
 function beatSync({ silent = false, noUndo = false } = {}) {
   const mus = P().music;
@@ -926,9 +951,79 @@ function shuffleClips() {
   renderAll(); save();
 }
 
+/* ---------- Music library (built-in tracks) ---------- */
+const previewEl = new Audio();
+previewEl.preload = 'none';
+async function loadLibrary() {
+  try {
+    const r = await fetch('music/library.json', { cache: 'no-cache' });
+    if (!r.ok) throw new Error(r.status);
+    state.library = await r.json();
+  } catch (e) { console.warn('music library unavailable', e); state.library = []; }
+  renderLibrary();
+}
+function trackForTheme(themeKey) {
+  const lib = state.library;
+  if (!lib.length) return null;
+  return lib.find(t => (t.themes || []).includes(themeKey)) || lib[0];
+}
+function stopPreview() {
+  previewEl.pause();
+  state.previewId = null;
+  $$('.lib-item .play').forEach(b => { b.textContent = '▶'; });
+}
+function togglePreview(track, btn) {
+  if (state.previewId === track.id) { stopPreview(); return; }
+  stopPreview();
+  pause();
+  state.previewId = track.id;
+  previewEl.src = track.file;
+  previewEl.currentTime = 0;
+  previewEl.play().catch(() => { stopPreview(); toast('Could not play the preview'); });
+  btn.textContent = '■';
+}
+previewEl.addEventListener('ended', stopPreview);
+async function useLibraryTrack(id, opts = {}) {
+  const track = state.library.find(t => t.id === id);
+  if (!track) { toast('Track not found'); return false; }
+  stopPreview();
+  if (!opts.silent) toast(`Loading ${track.name}…`, 20000);
+  try {
+    const r = await fetch(track.file);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const blob = await r.blob();
+    const file = new File([blob], `${track.name}.mp3`, { type: 'audio/mpeg' });
+    await setMusic(file, { libraryId: track.id, silent: opts.silent, noUndo: opts.noUndo });
+    return true;
+  } catch (e) {
+    console.warn(e);
+    toast(`Could not load ${track.name}: ${e.message || e}`, 5000);
+    return false;
+  }
+}
+function renderLibrary() {
+  const list = $('#libraryList');
+  if (!list) return;
+  if (!state.library.length) { list.innerHTML = '<div class="muted small-text">No built-in tracks available offline yet. Add your own file below.</div>'; return; }
+  list.innerHTML = '';
+  const current = P().music && P().music.libraryId;
+  state.library.forEach(track => {
+    const d = document.createElement('div');
+    d.className = 'lib-item' + (current === track.id ? ' active' : '');
+    d.innerHTML = `<button class="icon-btn play" title="Preview">${state.previewId === track.id ? '■' : '▶'}</button>` +
+      `<div class="meta"><div class="name">${track.name}</div><div class="sub">${track.mood} · ${track.bpm} BPM · ${fmt(track.duration)}</div></div>` +
+      `<button class="small-btn use">${current === track.id ? 'In use' : 'Use'}</button>`;
+    d.querySelector('.play').addEventListener('click', (e) => togglePreview(track, e.currentTarget));
+    const useBtn = d.querySelector('.use');
+    useBtn.disabled = current === track.id;
+    useBtn.addEventListener('click', () => useLibraryTrack(track.id));
+    list.appendChild(d);
+  });
+}
+
 /* ---------- Music ---------- */
-async function setMusic(file) {
-  toast('Analyzing music…', 30000);
+async function setMusic(file, opts = {}) {
+  if (!opts.silent) toast('Analyzing music…', 30000);
   const id = uid();
   await DB.putFile(id, file);
   const url = URL.createObjectURL(file);
@@ -938,16 +1033,16 @@ async function setMusic(file) {
     await new Promise(res => { musicEl.addEventListener('loadedmetadata', res, { once: true }); musicEl.src = url; });
     analysis.duration = musicEl.duration;
   }
-  pushUndo();
+  if (!opts.noUndo) pushUndo();
   if (P().music && P().music.fileId) DB.deleteFile(P().music.fileId);
   P().music = {
     fileId: id, name: file.name, volume: 0.8, offset: 0, fadeIn: 1, fadeOut: 2, loop: true, duck: true,
-    beats: analysis.beats, duration: analysis.duration, bpm: analysis.bpm
+    beats: analysis.beats, duration: analysis.duration, bpm: analysis.bpm, libraryId: opts.libraryId || null
   };
   musicEl.src = url;
   ensureAudioIfReady();
   renderAll(); save();
-  toast(`Music added · ${analysis.beats.length} beats${analysis.bpm ? ` · ~${analysis.bpm} BPM` : ''}`);
+  if (!opts.silent) toast(`Music added · ${analysis.beats.length} beats${analysis.bpm ? ` · ~${analysis.bpm} BPM` : ''}`);
 }
 function ensureAudioIfReady() { if (actx) connectAudioEl(musicEl); }
 async function restoreMusic(mus) {
@@ -990,9 +1085,14 @@ async function shareExport() {
   downloadBlob(exportBlob, exportName);
 }
 function pickMime() {
-  const cands = ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm', 'video/mp4;codecs=avc1,mp4a.40.2', 'video/mp4'];
   if (!window.MediaRecorder) return '';
-  return cands.find(m => MediaRecorder.isTypeSupported(m)) || '';
+  // H.264/AAC MP4 first: it is what Photos, WhatsApp and most players accept (iOS Photos cannot import WebM).
+  const cands = [
+    'video/mp4;codecs=avc1.42E01E,mp4a.40.2', 'video/mp4;codecs=avc1.4D401E,mp4a.40.2', 'video/mp4;codecs=avc1,mp4a.40.2',
+    'video/mp4;codecs=h264,aac', 'video/mp4;codecs=avc1', 'video/mp4',
+    'video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm'
+  ];
+  return cands.find(m => { try { return MediaRecorder.isTypeSupported(m); } catch (e) { return false; } }) || '';
 }
 function openExport() {
   if (!P().clips.length) { toast('Nothing to export yet'); return; }
@@ -1022,7 +1122,7 @@ function startExport() {
   if (recDest) recDest.stream.getAudioTracks().forEach(t => stream.addTrack(t));
   recChunks = []; exportMime = mime;
   try {
-    recorder = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: res === 1920 ? 14e6 : 7e6, audioBitsPerSecond: 192000 });
+    recorder = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: res === 1920 ? 10e6 : 5e6, audioBitsPerSecond: 160000 });
   } catch (e) { toast('Could not start the recorder: ' + e.message); setCanvasSize(PREVIEW_LONG); return; }
   recorder.ondataavailable = (e) => { if (e.data && e.data.size) recChunks.push(e.data); };
   recorder.onstop = () => {
@@ -1034,9 +1134,11 @@ function startExport() {
       $('#exportDialog').hidden = false;
       $('#exportProgressWrap').hidden = true;
       $('#exportResult').hidden = false;
-      $('#exportResultText').textContent = `Done · ${exportName} · ${(exportBlob.size / 1e6).toFixed(1)} MB · ${fmt(totalDuration())}`;
+      $('#exportResultText').textContent = `Done · ${exportName} · ${(exportBlob.size / 1e6).toFixed(1)} MB · ${fmt(totalDuration())}` +
+        (ext === 'webm' && IS_IOS ? ' · This browser could only record WebM, which Photos cannot save; use “Download file” to keep it in Files.' : '');
       const canShare = !!(navigator.canShare && navigator.canShare({ files: [new File([exportBlob], exportName, { type: exportBlob.type })] }));
       $('#exportShareBtn').hidden = !canShare;
+      $('#exportShareBtn').textContent = ext === 'mp4' ? 'Save to Photos / Share…' : 'Share…';
       $('#exportStartBtn').hidden = true;
       $('#exportCancelBtn').textContent = 'Close';
       if (!canShare && !IS_IOS) downloadBlob(exportBlob, exportName);
@@ -1053,7 +1155,8 @@ function startExport() {
   // Pre-render first frame so the recording does not start black.
   state.playhead = 0;
   renderAt(0).then(() => {
-    recorder.start(250);
+    // Safari's MP4 recorder delivers one complete file at stop; timeslices are only used for WebM.
+    if (exportMime.includes('mp4')) recorder.start(); else recorder.start(250);
     play();
   });
 }
@@ -1263,6 +1366,7 @@ function renderInspector() {
   renderThemeGrid();
   setSeg('paceSeg', 'pace', P().pace);
   $('#themeTitle').checked = !!P().themeTitle;
+  $('#themeMusic').checked = P().themeMusic !== false;
   renderMusicPanel();
   $('#projectTitle').value = P().title; $('#projectTitleMobile').value = P().title;
   if (!c || !m) return;
@@ -1357,10 +1461,11 @@ function renderThemeGrid() {
 }
 function renderMusicPanel() {
   const mus = P().music;
+  renderLibrary();
   $('#musicEditor').hidden = !mus;
   $('#musicInfo').textContent = mus
     ? `♫ ${mus.name} · ${fmt(mus.duration)}${mus.bpm ? ` · ~${mus.bpm} BPM` : ''} · ${mus.beats.length} beats`
-    : 'No music. Add a track to unlock beat sync.';
+    : 'No music. Pick a built-in track or add your own to unlock beat sync.';
   if (!mus) return;
   $('#musicVolume').value = mus.volume; $('#musicVolumeLabel').textContent = `${Math.round(mus.volume * 100)}%`;
   $('#musicOffset').max = Math.max(0, mus.duration - 1); $('#musicOffset').value = mus.offset; $('#musicOffsetLabel').textContent = `${mus.offset.toFixed(1)}s`;
@@ -1570,6 +1675,7 @@ function bindUI() {
   // Theme tab
   $$('#paceSeg button').forEach(b => b.addEventListener('click', () => { P().pace = b.dataset.pace; setSeg('paceSeg', 'pace', P().pace); save(); }));
   $('#themeTitle').addEventListener('change', (e) => { P().themeTitle = e.target.checked; save(); });
+  $('#themeMusic').addEventListener('change', (e) => { P().themeMusic = e.target.checked; save(); });
   $('#applyThemeBtn').addEventListener('click', () => { if (!P().clips.length) { toast('Add clips first'); return; } pause(); pushUndo(); applyTheme({ retrim: false }); renderAll(); save(); toast(`${THEMES[P().theme].name} theme applied`); });
   $('#shuffleBtn').addEventListener('click', () => { pause(); shuffleClips(); });
 
@@ -1632,6 +1738,7 @@ async function boot() {
   await restore();
   applyAspect();
   renderAll();
+  loadLibrary();
   if (state.media.size) toast('Welcome back – your project was restored');
 }
 boot();
@@ -1640,5 +1747,5 @@ window.addEventListener('error', (e) => { if (e && e.message) toast(`Error: ${e.
 window.addEventListener('unhandledrejection', (e) => { const r = e && e.reason; toast(`Error: ${r && r.message ? r.message : r}`, 6000); });
 
 /* Exposed for debugging / tests */
-window.QuikWeb = { state, importFiles, addToTimeline, autoCreate, applyTheme, beatSync, play, pause, setPlayhead, renderAt, totalDuration, layout, setMusic, splitAtPlayhead, startExport, pickMime };
+window.QuikWeb = { state, importFiles, addToTimeline, autoCreate, applyTheme, beatSync, play, pause, setPlayhead, renderAt, totalDuration, layout, setMusic, splitAtPlayhead, startExport, pickMime, useLibraryTrack, loadLibrary };
 })();

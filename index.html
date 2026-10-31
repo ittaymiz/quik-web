@@ -235,11 +235,13 @@
 
       <!-- Music tab -->
       <section class="tab-page" data-page="music">
+        <div id="musicInfo" class="muted small-text">No music. Pick a built-in track or add your own to unlock beat sync.</div>
+        <label class="field-label">Built-in tracks</label>
+        <div id="libraryList" class="lib-list"><div class="muted small-text">Loading…</div></div>
         <div class="field-row">
-          <button id="addMusicBtn" class="small-btn wide">🎵 Add music track</button>
+          <button id="addMusicBtn" class="small-btn wide">🎵 Add your own music file</button>
           <input id="musicInput" type="file" accept="audio/*" hidden>
         </div>
-        <div id="musicInfo" class="muted small-text">No music. Add a track to unlock beat sync.</div>
         <div id="musicEditor" hidden>
           <label class="field-label">Music volume <span id="musicVolumeLabel"></span></label>
           <input type="range" id="musicVolume" min="0" max="1" step="0.05" value="0.8">
@@ -282,6 +284,7 @@
           <button data-pace="fast">Fast</button>
         </div>
         <label class="check"><input type="checkbox" id="themeTitle" checked> Add project title on the first clip</label>
+        <label class="check"><input type="checkbox" id="themeMusic" checked> Add the theme's music automatically</label>
         <div class="field-row">
           <button id="applyThemeBtn" class="primary-btn wide">Apply theme to current clips</button>
         </div>

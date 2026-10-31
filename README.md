@@ -47,7 +47,7 @@ On the phone the timeline is scrubbed by dragging on the time ruler; clips are r
 | Filters | 12 looks (Vivid, Warm, Cool, B&W, Vintage, Dramatic, …) plus brightness, contrast, saturation and vignette. Apply to one clip or all. |
 | Text | Title per clip with position, style (Bold, Outline, Box, Lower third, Minimal), size, colors, animation and duration. |
 | Transitions | Cut, Crossfade, Fade through black, White flash, Slide, Zoom, Wipe, with adjustable length. |
-| Music | Add any audio file. Volume, start offset, fade in/out, loop, auto-ducking of clip audio. Beat detection with **Sync cuts to beats** and **Fit video length to music**. |
+| Music | 10 built-in tracks (pop, electronic, lo-fi, synthwave, folk, ambient, hip-hop, house, tropical, cinematic) with preview, or add any audio file. Auto Create adds the theme's track automatically. Volume, start offset, fade in/out, loop, auto-ducking of clip audio. Beat detection with **Sync cuts to beats** and **Fit video length to music**. |
 | Playback | Real-time preview with scrubbing, keyboard shortcuts and timeline zoom. |
 | Export | Renders to WebM (VP9/Opus, or MP4 where the browser supports it) at 720p or 1080p, 30 or 60 fps. Frame grab saves the current frame as PNG. |
 | Undo / redo | Every edit is undoable (Ctrl+Z / Ctrl+Y). |
@@ -63,6 +63,16 @@ On the phone the timeline is scrubbed by dragging on the time ruler; clips are r
 | Delete | Delete selected clip |
 | [ / ] | Set trim start / end at playhead |
 | Ctrl+Z / Ctrl+Y | Undo / redo |
+
+## Built-in music
+
+The `music/` folder holds ten original tracks that were synthesised for this project with
+`tools/make_music.py` (numpy + ffmpeg). They carry no third-party licence, so the exported videos can
+be shared freely. `music/library.json` describes each track (name, mood, BPM, duration, and which themes
+pick it by default).
+
+To use your own tracks instead, drop MP3 files into `music/` and add entries to `library.json`.
+To regenerate or tweak the built-in ones, edit the `LIBRARY` table in `tools/make_music.py` and run it.
 
 ## How it works
 

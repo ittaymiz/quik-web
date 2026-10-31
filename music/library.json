@@ -1,0 +1,131 @@
+[
+  {
+    "id": "sunrise-drive",
+    "name": "Sunrise Drive",
+    "mood": "Uplifting pop",
+    "bpm": 112,
+    "file": "music/sunrise-drive.mp3",
+    "duration": 80.7,
+    "themes": [
+      "classic",
+      "travel"
+    ],
+    "license": "Original work generated for this project (CC0 / public domain)"
+  },
+  {
+    "id": "adrenaline",
+    "name": "Adrenaline",
+    "mood": "Energetic electronic",
+    "bpm": 140,
+    "file": "music/adrenaline.mp3",
+    "duration": 72.2,
+    "themes": [
+      "action"
+    ],
+    "license": "Original work generated for this project (CC0 / public domain)"
+  },
+  {
+    "id": "lazy-afternoon",
+    "name": "Lazy Afternoon",
+    "mood": "Lo-fi chill",
+    "bpm": 80,
+    "file": "music/lazy-afternoon.mp3",
+    "duration": 87.6,
+    "themes": [
+      "chill"
+    ],
+    "license": "Original work generated for this project (CC0 / public domain)"
+  },
+  {
+    "id": "night-city",
+    "name": "Night City",
+    "mood": "Synthwave",
+    "bpm": 100,
+    "file": "music/night-city.mp3",
+    "duration": 80.4,
+    "themes": [
+      "noir",
+      "epic"
+    ],
+    "license": "Original work generated for this project (CC0 / public domain)"
+  },
+  {
+    "id": "mountain-air",
+    "name": "Mountain Air",
+    "mood": "Acoustic folk",
+    "bpm": 92,
+    "file": "music/mountain-air.mp3",
+    "duration": 87.1,
+    "themes": [
+      "travel",
+      "classic"
+    ],
+    "license": "Original work generated for this project (CC0 / public domain)"
+  },
+  {
+    "id": "deep-focus",
+    "name": "Deep Focus",
+    "mood": "Ambient",
+    "bpm": 70,
+    "file": "music/deep-focus.mp3",
+    "duration": 85.9,
+    "themes": [
+      "dreamy",
+      "chill"
+    ],
+    "license": "Original work generated for this project (CC0 / public domain)"
+  },
+  {
+    "id": "street-beat",
+    "name": "Street Beat",
+    "mood": "Hip-hop",
+    "bpm": 94,
+    "file": "music/street-beat.mp3",
+    "duration": 85.3,
+    "themes": [
+      "action",
+      "noir"
+    ],
+    "license": "Original work generated for this project (CC0 / public domain)"
+  },
+  {
+    "id": "festival",
+    "name": "Festival",
+    "mood": "House",
+    "bpm": 126,
+    "file": "music/festival.mp3",
+    "duration": 79.8,
+    "themes": [
+      "action",
+      "travel"
+    ],
+    "license": "Original work generated for this project (CC0 / public domain)"
+  },
+  {
+    "id": "golden-hour",
+    "name": "Golden Hour",
+    "mood": "Tropical",
+    "bpm": 104,
+    "file": "music/golden-hour.mp3",
+    "duration": 86.7,
+    "themes": [
+      "travel",
+      "dreamy",
+      "chill"
+    ],
+    "license": "Original work generated for this project (CC0 / public domain)"
+  },
+  {
+    "id": "epic-horizon",
+    "name": "Epic Horizon",
+    "mood": "Cinematic",
+    "bpm": 84,
+    "file": "music/epic-horizon.mp3",
+    "duration": 83.6,
+    "themes": [
+      "epic",
+      "noir"
+    ],
+    "license": "Original work generated for this project (CC0 / public domain)"
+  }
+]

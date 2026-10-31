@@ -135,6 +135,15 @@ button:disabled { opacity: 0.5; cursor: default; filter: none; }
 .theme-card .name { font-weight: 600; font-size: 13px; }
 .theme-card .desc { font-size: 11px; color: var(--muted); }
 
+.lib-list { display: flex; flex-direction: column; gap: 6px; }
+.lib-item { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel-2); }
+.lib-item.active { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset; }
+.lib-item .play { width: 32px; height: 32px; flex-shrink: 0; }
+.lib-item .meta { flex: 1; min-width: 0; }
+.lib-item .name { font-weight: 600; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.lib-item .sub { font-size: 11px; color: var(--muted); }
+.lib-item .use { flex-shrink: 0; }
+
 /* ---------- Timeline ---------- */
 .timeline-panel { background: var(--panel); border-top: 1px solid var(--border); display: flex; flex-direction: column; min-height: 0; }
 .timeline-head { display: flex; align-items: center; gap: 10px; padding: 6px 12px; border-bottom: 1px solid var(--border); }
