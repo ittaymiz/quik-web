@@ -36,7 +36,7 @@ function toast(msg, ms = 2200) {
    State
    ====================================================================== */
 function newProject() {
-  return { title: '', aspect: '16:9', theme: 'classic', pace: 'medium', themeTitle: true, themeMusic: true, clips: [], music: null };
+  return { title: '', aspect: '16:9', theme: 'classic', pace: 'medium', themeTitle: true, themeMusic: true, targetLength: 120, clips: [], music: null };
 }
 function defaultClip(m) {
   return {
@@ -639,6 +639,16 @@ function setPlayhead(t, render = true) {
    Playback engine
    ====================================================================== */
 let wallStart = 0, tStart = 0, activeIdx = -1, rafId = 0, holdFrame = null, frameReady = true;
+const prerolled = new Set();
+function prerollNext(loc) {
+  const next = P().clips[loc.idx + 1];
+  if (!next || next.kind !== 'video' || prerolled.has(next.id)) return;
+  if (loc.dur - loc.lt > 1.2) return;
+  const nm = state.media.get(next.mediaId), cm = state.media.get(loc.clip.mediaId);
+  if (!nm || (cm && nm.el === cm.el)) return;   // same element still playing the current clip
+  prerolled.add(next.id);
+  try { nm.el.playbackRate = clamp(next.speed, 0.0625, 16); nm.el.currentTime = next.start; } catch (e) {}
+}
 
 function effectiveClipVolume(c) {
   const mus = P().music;
@@ -668,9 +678,36 @@ function musicVolumeAt(t) {
   if (mus.fadeOut > 0) v *= clamp((total - t) / mus.fadeOut, 0, 1);
   return clamp(v, 0, 1);
 }
+let musicNode = null, musicGain = null, musicBuffer = null, musicBufferKey = null;
+async function prepareMusicBuffer() {
+  const mus = P().music;
+  if (!mus || !state.musicBlob) { musicBuffer = null; musicBufferKey = null; return; }
+  const key = 'music:' + mus.fileId;
+  if (musicBufferKey === key && musicBuffer) return;
+  const buf = await getAudioBuffer(key, state.musicBlob);
+  if (P().music && 'music:' + P().music.fileId === key) { musicBuffer = buf; musicBufferKey = key; }
+}
+function stopMusicNode() {
+  if (musicNode) { try { musicNode.stop(); } catch (e) {} try { musicNode.disconnect(); } catch (e) {} musicNode = null; }
+  if (musicGain) { try { musicGain.disconnect(); } catch (e) {} musicGain = null; }
+}
 function startMusic(t) {
   const mus = P().music;
   if (!mus) return;
+  stopMusicNode();
+  if (actx && masterGain && musicBuffer && musicBufferKey === 'music:' + mus.fileId) {
+    // Web Audio playback: sample-accurate and never interrupted by video elements on iOS.
+    const len = musicBuffer.duration;
+    let pos = (mus.offset || 0) + t;
+    if (pos >= len) { if (!mus.loop) return; pos = (pos - len) % len; }
+    const src = actx.createBufferSource();
+    src.buffer = musicBuffer; src.loop = !!mus.loop;
+    musicGain = actx.createGain(); musicGain.gain.value = musicVolumeAt(t);
+    src.connect(musicGain); musicGain.connect(masterGain); if (recDest) musicGain.connect(recDest);
+    src.start(0, pos);
+    musicNode = src;
+    return;
+  }
   musicEl.loop = !!mus.loop;
   let pos = mus.offset + t;
   if (mus.loop && mus.duration > 0) pos = mus.offset + ((t) % Math.max(0.1, mus.duration - mus.offset));
@@ -688,7 +725,7 @@ function play() {
   const total = totalDuration();
   if (state.playhead >= total - 0.05) state.playhead = 0;
   state.playing = true;
-  wallStart = performance.now(); tStart = state.playhead; activeIdx = -1;
+  wallStart = performance.now(); tStart = state.playhead; activeIdx = -1; prerolled.clear();
   startMusic(state.playhead);
   $('#playBtn').textContent = '❚❚';
   cancelAnimationFrame(rafId);
@@ -699,7 +736,8 @@ function pause() {
   state.playing = false;
   cancelAnimationFrame(rafId);
   if (activeIdx >= 0 && P().clips[activeIdx]) stopClipMedia(P().clips[activeIdx]);
-  activeIdx = -1;
+  activeIdx = -1; prerolled.clear();
+  stopMusicNode();
   musicEl.pause();
   $('#playBtn').textContent = '▶';
   renderAt(state.playhead);
@@ -743,9 +781,13 @@ function tick() {
     }
   }
   state.playhead = t;
+  prerollNext(loc);
   if (!frameReady && holdFrame) { ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.filter = 'none'; ctx.drawImage(holdFrame, 0, 0); }
   else drawFrameNow(loc);
-  if (P().music) { setElVolume(musicEl, musicVolumeAt(t)); if (musicEl.paused && musicEl.src && (P().music.loop || P().music.offset + t < P().music.duration)) musicEl.play().catch(() => {}); }
+  if (P().music) {
+    if (musicGain) musicGain.gain.value = musicVolumeAt(t);
+    else { setElVolume(musicEl, musicVolumeAt(t)); if (musicEl.paused && musicEl.src && (P().music.loop || P().music.offset + t < P().music.duration)) musicEl.play().catch(() => {}); }
+  }
   updatePlayheadUI();
   if (state.exporting) updateExportProgress(t / total);
   rafId = requestAnimationFrame(tick);
@@ -831,19 +873,92 @@ function nudgeClip(id, dir) {
 }
 function invalidate(clip) { if (clip) state.snapCache.delete(clip.id); }
 
-/* ---------- Theme / auto create / beat sync ---------- */
-function pickSegments(m, pace) {
-  // Choose 1–3 evenly spaced highlight segments from a long video.
-  const n = clamp(Math.floor(m.duration / (pace * 3)), 1, 3);
-  const len = Math.min(m.duration, pace);
-  const segs = [];
-  for (let i = 0; i < n; i++) {
-    const center = m.duration * (i + 1) / (n + 1);
-    const start = clamp(center - len / 2, 0, Math.max(0, m.duration - len));
-    segs.push([start, start + len]);
-  }
-  return segs;
+/* ---------- Target length / edit planner ---------- */
+function targetSeconds() {
+  const t = P().targetLength;
+  if (t === 'music') return P().music ? Math.max(10, P().music.duration - (P().music.offset || 0)) : 120;
+  return clamp(Number(t) || 120, 5, 3600);
 }
+function fmtLen(sec) { const m = Math.floor(sec / 60), r = Math.round(sec % 60); return m ? `${m}:${String(r).padStart(2, '0')}` : `${r}s`; }
+/* Builds a fresh clip list from everything in the media bin so that the whole video lasts ~target seconds:
+   segments are spread evenly across each video, photos are interleaved. */
+function planEdit(target) {
+  const pace = PACE[P().pace] || PACE.medium;
+  const videos = [], images = [];
+  state.media.forEach(m => (m.kind === 'video' ? videos : images).push(m));
+  if (!videos.length && !images.length) return [];
+  let imgDur = clamp(pace, 2, 4);
+  if (images.length * imgDur > target * 0.4 && images.length) imgDur = Math.max(1.5, target * 0.4 / images.length);
+  const imgTotal = images.length * imgDur;
+  const videoBudget = Math.max(0, target - imgTotal);
+  const totalSrc = videos.reduce((a, m) => a + m.duration, 0);
+  const videoClips = [];
+  if (videos.length) {
+    if (totalSrc <= videoBudget * 1.02) {
+      // Less footage than the target: use everything, cut into pace-sized pieces for rhythm.
+      videos.forEach(m => {
+        const k = Math.max(1, Math.round(m.duration / pace));
+        const seg = m.duration / k;
+        for (let j = 0; j < k; j++) { const c = defaultClip(m); c.start = j * seg; c.end = Math.min(m.duration, (j + 1) * seg); videoClips.push(c); }
+      });
+    } else {
+      videos.forEach(m => {
+        const share = videoBudget * m.duration / totalSrc;
+        const k = Math.max(1, Math.round(share / pace));
+        const segLen = clamp(share / k, 0.8, m.duration);
+        const margin = Math.min(m.duration * 0.05, 1);
+        const usable = Math.max(segLen, m.duration - 2 * margin);
+        for (let j = 0; j < k; j++) {
+          const center = margin + usable * (j + 0.5) / k;
+          const c = defaultClip(m);
+          c.start = clamp(center - segLen / 2, 0, Math.max(0, m.duration - segLen));
+          c.end = Math.min(m.duration, c.start + segLen);
+          videoClips.push(c);
+        }
+      });
+    }
+  }
+  const imageClips = images.map(m => { const c = defaultClip(m); c.imageDuration = imgDur; c.kenBurns = true; return c; });
+  // Interleave photos evenly between video clips.
+  const out = [];
+  if (!videoClips.length) return imageClips;
+  const every = (videoClips.length + 1) / (imageClips.length + 1);
+  let nextImg = every, ii = 0;
+  videoClips.forEach((c, i) => {
+    out.push(c);
+    while (ii < imageClips.length && i + 1 >= nextImg) { out.push(imageClips[ii++]); nextImg += every; }
+  });
+  while (ii < imageClips.length) out.push(imageClips[ii++]);
+  return out;
+}
+/* Latest source time a clip may extend to without running into another clip cut from the same file. */
+function maxEndFor(c) {
+  const m = state.media.get(c.mediaId);
+  if (!m) return c.end;
+  let lim = m.duration;
+  P().clips.forEach(o => { if (o !== c && o.mediaId === c.mediaId && o.start >= c.end - 0.01 && o.start < lim) lim = o.start; });
+  return lim;
+}
+/* Scales every clip so the video lasts ~target seconds (bounded by the available footage). */
+function fitToLength(target, { silent = false } = {}) {
+  const total = totalDuration();
+  if (!total || !P().clips.length) return;
+  const f = target / total;
+  P().clips.forEach(c => {
+    const m = state.media.get(c.mediaId);
+    if (c.kind === 'image') c.imageDuration = clamp(c.imageDuration * f, 1, 6);
+    else if (m) {
+      const want = clipDuration(c) * f;
+      const maxDur = (maxEndFor(c) - c.start) / c.speed;   // never beyond the clip's own footage
+      c.end = c.start + Math.min(want, maxDur) * c.speed;
+    }
+    c.transition.duration = Math.min(c.transition.duration, Math.max(0.2, clipDuration(c) / 2));
+  });
+  state.snapCache.clear();
+  if (!silent) { renderAll(); save(); toast(`Video is now ${fmt(totalDuration())}`); }
+}
+
+/* ---------- Theme / auto create / beat sync ---------- */
 function applyTheme({ retrim = false } = {}) {
   const th = THEMES[P().theme] || THEMES.classic;
   const pace = PACE[P().pace] || PACE.medium;
@@ -881,46 +996,52 @@ async function autoCreate() {
     const track = trackForTheme(P().theme);
     if (track) { toast(`Adding theme music: ${track.name}…`, 20000); await useLibraryTrack(track.id, { silent: true, noUndo: true }); }
   }
-  const pace = PACE[P().pace] || PACE.medium;
-  if (!P().clips.length) {
-    state.media.forEach(m => {
-      if (m.kind === 'image') { P().clips.push(defaultClip(m)); return; }
-      pickSegments(m, pace).forEach(([s, e]) => { const c = defaultClip(m); c.start = s; c.end = e; P().clips.push(c); });
-    });
-  }
-  applyTheme({ retrim: true });
-  if (P().music && P().music.beats && P().music.beats.length) beatSync({ silent: true, noUndo: true });
+  const target = targetSeconds();
+  P().clips = planEdit(target);
+  applyTheme({ retrim: false });
+  const effTarget = Math.min(target, totalDuration());   // cannot be longer than the footage
+  if (P().music && P().music.beats && P().music.beats.length) beatSync({ silent: true, noUndo: true, target: effTarget });
+  else fitToLength(effTarget, { silent: true });
   state.selectedId = P().clips[0] ? P().clips[0].id : null;
   // Park just after the opening fade so the preview shows a real frame.
   state.playhead = P().clips[0] ? Math.min(P().clips[0].transition.duration, clipDuration(P().clips[0]) / 2) : 0;
   renderAll(); save();
   if (phoneLayout.matches) $('.tab[data-tab="clip"]').click();
-  toast(`Auto-created a ${THEMES[P().theme].name} edit · ${fmt(totalDuration())}${P().music ? ` · ♫ ${P().music.name.replace(/\.mp3$/, '')}` : ''}`, 3500);
+  const got = totalDuration();
+  const short = got < target * 0.9 ? ` (only ${fmt(got)} of footage for a ${fmtLen(target)} target)` : '';
+  toast(`Auto-created a ${THEMES[P().theme].name} edit · ${fmt(got)}${short}${P().music ? ` · ♫ ${P().music.name.replace(/\.mp3$/, '')}` : ''}`, 4000);
 }
-function beatSync({ silent = false, noUndo = false } = {}) {
+function beatSync({ silent = false, noUndo = false, target = null } = {}) {
   const mus = P().music;
   if (!mus || !mus.beats || !mus.beats.length) { toast('Add a music track first'); return; }
   if (!P().clips.length) { toast('Add some clips first'); return; }
   if (!noUndo) pushUndo();
-  const target = PACE[P().pace] || PACE.medium;
-  const beats = mus.beats.map(b => b - mus.offset).filter(b => b > 0.3);
+  const pace = PACE[P().pace] || PACE.medium;
+  // Beats repeat when the music loops, so cuts can be aligned beyond the track length.
+  const span = Math.max(1, mus.duration - (mus.offset || 0));
+  const base = mus.beats.map(b => b - mus.offset).filter(b => b > 0.3);
+  const beats = [];
+  const needed = target || totalDuration();
+  for (let k = 0; k * span < needed + span && k < 50; k++) base.forEach(b => beats.push(b + k * span));
+  const scale = target ? target / Math.max(0.1, totalDuration()) : 1;
   let t = 0;
   P().clips.forEach(c => {
     const m = state.media.get(c.mediaId);
-    const desired = t + target;
+    const want = target ? clipDuration(c) * scale : pace;
+    const desired = t + want;
     let best = null, bestD = Infinity;
     for (const b of beats) {
-      if (b < t + 0.5) continue;
+      if (b < t + Math.max(0.5, want * 0.5)) continue;
       const d = Math.abs(b - desired);
       if (d < bestD) { bestD = d; best = b; }
-      if (b > desired + target) break;
+      if (b > desired + want) break;
     }
-    let dur = best !== null ? best - t : target;
-    if (c.kind === 'image') c.imageDuration = clamp(dur, 0.5, 10);
+    let dur = best !== null ? best - t : want;
+    if (c.kind === 'image') c.imageDuration = clamp(dur, 0.5, 6);
     else if (m) {
-      const maxDur = (m.duration - c.start) / c.speed;
+      const maxDur = (maxEndFor(c) - c.start) / c.speed;
       dur = Math.min(dur, maxDur);
-      if (dur < 0.4) dur = Math.min(maxDur, target);
+      if (dur < 0.4) dur = Math.min(maxDur, want);
       c.end = Math.min(m.duration, c.start + dur * c.speed);
     }
     const cd = clipDuration(c);
@@ -1051,7 +1172,8 @@ async function setMusic(file, opts = {}) {
   };
   musicEl.src = url;
   state.musicBlob = file;
-  audioBufferCache.clear();
+  audioBufferCache.clear(); musicBuffer = null; musicBufferKey = null;
+  prepareMusicBuffer();
   ensureAudioIfReady();
   renderAll(); save();
   if (!opts.silent) toast(`Music added · ${analysis.beats.length} beats${analysis.bpm ? ` · ~${analysis.bpm} BPM` : ''}`);
@@ -1062,13 +1184,14 @@ async function restoreMusic(mus) {
   if (!blob) { P().music = null; return; }
   state.musicBlob = blob;
   musicEl.src = URL.createObjectURL(blob);
+  prepareMusicBuffer();
 }
 function removeMusic() {
   if (!P().music) return;
   pushUndo();
   DB.deleteFile(P().music.fileId);
-  P().music = null; state.musicBlob = null;
-  musicEl.pause(); musicEl.removeAttribute('src');
+  P().music = null; state.musicBlob = null; musicBuffer = null; musicBufferKey = null;
+  stopMusicNode(); musicEl.pause(); musicEl.removeAttribute('src');
   renderAll(); save();
 }
 
@@ -1600,6 +1723,7 @@ function renderInspector() {
   setSeg('paceSeg', 'pace', P().pace);
   $('#themeTitle').checked = !!P().themeTitle;
   $('#themeMusic').checked = P().themeMusic !== false;
+  renderLengthControl();
   renderMusicPanel();
   $('#projectTitle').value = P().title; $('#projectTitleMobile').value = P().title;
   if (!c || !m) return;
@@ -1691,6 +1815,13 @@ function renderThemeGrid() {
     d.addEventListener('click', () => { P().theme = key; P().pace = th.pace; renderThemeGrid(); setSeg('paceSeg', 'pace', P().pace); save(); });
     grid.appendChild(d);
   });
+}
+function renderLengthControl() {
+  const t = P().targetLength;
+  setSeg('lengthSeg', 'len', t === 'music' ? 'music' : String(t));
+  const sec = targetSeconds();
+  $('#lengthSlider').value = clamp(sec, 10, 600);
+  $('#lengthLabel').textContent = t === 'music' ? `♫ ${fmtLen(sec)}` : fmtLen(sec);
 }
 function renderMusicPanel() {
   const mus = P().music;
@@ -1794,7 +1925,7 @@ function bindUI() {
   $('#dropZone').addEventListener('click', () => $('#fileInput').click());
   $('#fileInput').addEventListener('change', async (e) => { await importFiles(e.target.files); e.target.value = ''; });
   $('#addAllBtn').addEventListener('click', () => addToTimeline(Array.from(state.media.keys())));
-  $('#autoCreateBtn').addEventListener('click', async () => { autoCreate(); });
+  $('#autoCreateBtn').addEventListener('click', async () => { pause(); autoCreate(); });
   ['#dropZone', '.preview-area', '.media-panel'].forEach(sel => {
     const el = $(sel);
     el.addEventListener('dragover', (e) => { if (dragId) return; e.preventDefault(); el.classList.add('over'); });
@@ -1907,6 +2038,24 @@ function bindUI() {
 
   // Theme tab
   $$('#paceSeg button').forEach(b => b.addEventListener('click', () => { P().pace = b.dataset.pace; setSeg('paceSeg', 'pace', P().pace); save(); }));
+  $$('#lengthSeg button').forEach(b => b.addEventListener('click', () => {
+    const v = b.dataset.len;
+    if (v === 'music' && !P().music) { toast('Add a music track first to use its length'); return; }
+    P().targetLength = v === 'music' ? 'music' : Number(v);
+    renderLengthControl(); save();
+  }));
+  $('#lengthSlider').addEventListener('input', (e) => { P().targetLength = Number(e.target.value); renderLengthControl(); });
+  $('#lengthSlider').addEventListener('change', () => save());
+  $('#rearrangeBtn').addEventListener('click', () => { pause(); autoCreate(); });
+  $('#fitLengthBtn').addEventListener('click', () => {
+    if (!P().clips.length) { toast('Add clips first'); return; }
+    pause(); pushUndo();
+    const target = targetSeconds();
+    fitToLength(target, { silent: true });
+    if (P().music && P().music.beats && P().music.beats.length) beatSync({ silent: true, noUndo: true, target });
+    renderAll(); save();
+    toast(`Fitted to ${fmt(totalDuration())}`);
+  });
   $('#themeTitle').addEventListener('change', (e) => { P().themeTitle = e.target.checked; save(); });
   $('#themeMusic').addEventListener('change', (e) => { P().themeMusic = e.target.checked; save(); });
   $('#applyThemeBtn').addEventListener('click', () => { if (!P().clips.length) { toast('Add clips first'); return; } pause(); pushUndo(); applyTheme({ retrim: false }); renderAll(); save(); toast(`${THEMES[P().theme].name} theme applied`); });
@@ -1980,5 +2129,5 @@ window.addEventListener('error', (e) => { if (e && e.message) toast(`Error: ${e.
 window.addEventListener('unhandledrejection', (e) => { const r = e && e.reason; toast(`Error: ${r && r.message ? r.message : r}`, 6000); });
 
 /* Exposed for debugging / tests */
-window.QuikWeb = { HAS_WEBCODECS, startOfflineExport, state, importFiles, addToTimeline, autoCreate, applyTheme, beatSync, play, pause, setPlayhead, renderAt, totalDuration, layout, setMusic, splitAtPlayhead, startExport, pickMime, useLibraryTrack, loadLibrary };
+window.QuikWeb = { HAS_WEBCODECS, startOfflineExport, planEdit, fitToLength, targetSeconds, state, importFiles, addToTimeline, autoCreate, applyTheme, beatSync, play, pause, setPlayhead, renderAt, totalDuration, layout, setMusic, splitAtPlayhead, startExport, pickMime, useLibraryTrack, loadLibrary };
 })();

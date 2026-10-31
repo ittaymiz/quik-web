@@ -38,7 +38,7 @@ On the phone the timeline is scrubbed by dragging on the time ruler; clips are r
 | Area | What you can do |
 | --- | --- |
 | Import | Drag & drop or pick videos and photos. Files stay in the browser (IndexedDB) so a reload restores your project. |
-| Auto Create | Picks highlight segments from each video, applies the selected theme, adds the project title and syncs cuts to the music beats. |
+| Auto Create | Plans a whole edit for a chosen length (default 2 minutes): spreads segments across every video, interleaves photos, applies the theme, adds the title and music, and aligns the cuts to the beats. **Re-arrange** rebuilds it for a new length; **Fit** rescales the current clips. |
 | Themes | Classic, Action, Chill, Noir, Retro, Epic, Dreamy, Travel. Each sets a look, a transition style, a pace and a text style. |
 | Trim | Dual-handle trim slider with a filmstrip, or set start/end at the playhead (`[` and `]`). |
 | Split / reorder | Split at the playhead (`S`), drag clips on the timeline to reorder, duplicate, delete. |

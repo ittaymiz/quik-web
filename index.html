@@ -277,6 +277,22 @@
         </div>
         <p class="small-text muted">A theme sets the look, the transitions and the pace for the whole edit. Auto Create uses the selected theme.</p>
         <div class="theme-grid" id="themeGrid"></div>
+        <label class="field-label">Video length <span id="lengthLabel">2:00</span></label>
+        <div class="seg" id="lengthSeg">
+          <button data-len="15">15s</button>
+          <button data-len="30">30s</button>
+          <button data-len="60">1:00</button>
+          <button data-len="120" class="active">2:00</button>
+          <button data-len="180">3:00</button>
+          <button data-len="music" title="Same length as the music track">♫</button>
+        </div>
+        <input type="range" id="lengthSlider" min="10" max="600" step="5" value="120">
+        <div class="field-row">
+          <button id="rearrangeBtn" class="small-btn wide">↻ Re-arrange to this length</button>
+        </div>
+        <div class="field-row">
+          <button id="fitLengthBtn" class="small-btn wide">Fit current clips to this length</button>
+        </div>
         <label class="field-label">Pace</label>
         <div class="seg" id="paceSeg">
           <button data-pace="slow">Slow</button>
@@ -286,7 +302,7 @@
         <label class="check"><input type="checkbox" id="themeTitle" checked> Add project title on the first clip</label>
         <label class="check"><input type="checkbox" id="themeMusic" checked> Add the theme's music automatically</label>
         <div class="field-row">
-          <button id="applyThemeBtn" class="primary-btn wide">Apply theme to current clips</button>
+          <button id="applyThemeBtn" class="primary-btn wide">Apply theme look to current clips</button>
         </div>
         <div class="field-row">
           <button id="shuffleBtn" class="small-btn wide">🔀 Shuffle order</button>
