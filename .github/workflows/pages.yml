@@ -1,8 +1,7 @@
 name: Deploy to GitHub Pages
 on:
   push:
-    # Deploys from main and from the development branch so the app can be tried before merging.
-    branches: [main, claude/epic-mayer-81osdm]
+    branches: [main]
   workflow_dispatch:
 permissions:
   contents: read

@@ -23,7 +23,7 @@ are rendered natively there). It needs to be served over HTTPS, which GitHub Pag
 1. In this repository open **Settings → Pages** and set **Source** to **GitHub Actions**. The included
    workflow (`.github/workflows/pages.yml`) publishes the app on every push.
 2. Open `https://<your-github-user>.github.io/<repo-name>/` on the phone (for this repo:
-   `https://ittaymiz.github.io/empty-repo/`).
+   `https://ittaymiz.github.io/quik-web/`).
 3. Tap **Share → Add to Home Screen**. The app then opens full screen like a native app and works offline.
 4. **Media** tab → **+ Add** picks videos and photos from your Photos library. Tap **Auto Create**,
    then use the **Clip / Style / Text / Music / Theme** tabs to edit.
