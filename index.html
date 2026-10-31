@@ -326,7 +326,7 @@
         <option value="30" selected>30 fps</option>
         <option value="60">60 fps</option>
       </select>
-      <p class="small-text muted">Rendering happens in your browser in real time, so a 1‑minute video takes about a minute. Keep this tab visible while it renders.</p>
+      <p class="small-text muted" id="exportHint">The video is rendered frame by frame at full quality, with a clean audio mix. A 1‑minute video takes a minute or two. Keep the app open while it renders.</p>
       <div id="exportProgressWrap" hidden>
         <div class="progress"><div id="exportProgress" class="progress-bar"></div></div>
         <div id="exportStatus" class="small-text"></div>
@@ -350,6 +350,7 @@
   <div id="toast" class="toast" hidden></div>
 </div>
 
+<script src="js/vendor/mp4-muxer.js"></script>
 <script src="js/db.js"></script>
 <script src="js/beats.js"></script>
 <script src="js/presets.js"></script>

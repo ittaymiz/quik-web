@@ -18,7 +18,7 @@ const fmt = (s) => {
   return `${String(m).padStart(2, '0')}:${r.toFixed(1).padStart(4, '0')}`;
 };
 const ASPECTS = { '16:9': [16, 9], '9:16': [9, 16], '1:1': [1, 1], '4:5': [4, 5] };
-const PREVIEW_LONG = 1280;
+const PREVIEW_LONG = window.matchMedia('(max-width: 760px)').matches ? 960 : 1280;
 const MIN_CLIP = 0.2;
 const IS_IOS = /iP(hone|ad|od)/.test(navigator.platform) || (navigator.userAgent.includes('Mac') && 'ontouchend' in document);
 const HAS_CTX_FILTER = (() => { try { const c = document.createElement('canvas').getContext('2d'); return typeof c.filter === 'string'; } catch (e) { return false; } })();
@@ -393,6 +393,7 @@ function setCanvasSize(long) {
   if (aw >= ah) { W = long; H = Math.round(long * ah / aw); } else { H = long; W = Math.round(long * aw / ah); }
   W -= W % 2; H -= H % 2;
   canvas.width = W; canvas.height = H;
+  try { ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high'; } catch (e) {}
 }
 function applyAspect() {
   setCanvasSize(PREVIEW_LONG);
@@ -637,7 +638,7 @@ function setPlayhead(t, render = true) {
 /* ======================================================================
    Playback engine
    ====================================================================== */
-let wallStart = 0, tStart = 0, activeIdx = -1, rafId = 0;
+let wallStart = 0, tStart = 0, activeIdx = -1, rafId = 0, holdFrame = null, frameReady = true;
 
 function effectiveClipVolume(c) {
   const mus = P().music;
@@ -725,6 +726,14 @@ function tick() {
     }
     activeIdx = loc.idx;
     startClipMedia(loc.clip, loc.lt);
+    // Until the new clip has actually presented a frame, keep showing the last frame of the previous one.
+    const mm = state.media.get(loc.clip.mediaId);
+    if (loc.clip.kind === 'video' && mm && typeof mm.el.requestVideoFrameCallback === 'function') {
+      holdFrame = loc.idx > 0 ? state.snapCache.get(P().clips[loc.idx - 1].id) || null : null;
+      frameReady = false;
+      const token = activeIdx;
+      waitFrame(mm.el, 350).then(() => { if (token === activeIdx) { frameReady = true; holdFrame = null; } });
+    } else { frameReady = true; holdFrame = null; }
   } else if (loc.clip.kind === 'video') {
     const m = state.media.get(loc.clip.mediaId);
     if (m) {
@@ -734,7 +743,8 @@ function tick() {
     }
   }
   state.playhead = t;
-  drawFrameNow(loc);
+  if (!frameReady && holdFrame) { ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.filter = 'none'; ctx.drawImage(holdFrame, 0, 0); }
+  else drawFrameNow(loc);
   if (P().music) { setElVolume(musicEl, musicVolumeAt(t)); if (musicEl.paused && musicEl.src && (P().music.loop || P().music.offset + t < P().music.duration)) musicEl.play().catch(() => {}); }
   updatePlayheadUI();
   if (state.exporting) updateExportProgress(t / total);
@@ -1040,6 +1050,8 @@ async function setMusic(file, opts = {}) {
     beats: analysis.beats, duration: analysis.duration, bpm: analysis.bpm, libraryId: opts.libraryId || null
   };
   musicEl.src = url;
+  state.musicBlob = file;
+  audioBufferCache.clear();
   ensureAudioIfReady();
   renderAll(); save();
   if (!opts.silent) toast(`Music added · ${analysis.beats.length} beats${analysis.bpm ? ` · ~${analysis.bpm} BPM` : ''}`);
@@ -1048,19 +1060,241 @@ function ensureAudioIfReady() { if (actx) connectAudioEl(musicEl); }
 async function restoreMusic(mus) {
   const blob = await DB.getFile(mus.fileId);
   if (!blob) { P().music = null; return; }
+  state.musicBlob = blob;
   musicEl.src = URL.createObjectURL(blob);
 }
 function removeMusic() {
   if (!P().music) return;
   pushUndo();
   DB.deleteFile(P().music.fileId);
-  P().music = null;
+  P().music = null; state.musicBlob = null;
   musicEl.pause(); musicEl.removeAttribute('src');
   renderAll(); save();
 }
 
 /* ======================================================================
-   Export
+   Offline export: frame-accurate render with WebCodecs, muxed to MP4.
+   Falls back to the real-time MediaRecorder path when unavailable.
+   ====================================================================== */
+const HAS_WEBCODECS = typeof VideoEncoder !== 'undefined' && typeof VideoFrame !== 'undefined' && typeof Mp4Muxer !== 'undefined';
+const audioBufferCache = new Map();   // key -> AudioBuffer | null
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+let offline = null;                   // { cancelled }
+
+async function pickVideoCodec(w, h, fps, bitrate) {
+  const cands = [
+    { codec: 'avc1.640028', mux: 'avc' }, { codec: 'avc1.4d0028', mux: 'avc' }, { codec: 'avc1.42e028', mux: 'avc' },
+    { codec: 'avc1.640032', mux: 'avc' }, { codec: 'avc1.42001f', mux: 'avc' },
+    { codec: 'hvc1.1.6.L123.B0', mux: 'hevc' },
+    { codec: 'vp09.00.40.08', mux: 'vp9' }
+  ];
+  for (const c of cands) {
+    const cfg = { codec: c.codec, width: w, height: h, bitrate, framerate: fps, latencyMode: 'quality' };
+    if (c.mux === 'avc') cfg.avc = { format: 'avc' };
+    if (c.mux === 'hevc') cfg.hevc = { format: 'hevc' };
+    try { const r = await VideoEncoder.isConfigSupported(cfg); if (r && r.supported) return { ...c, cfg }; } catch (e) {}
+  }
+  return null;
+}
+async function pickAudioCodec(sampleRate) {
+  if (typeof AudioEncoder === 'undefined' || typeof AudioData === 'undefined') return null;
+  for (const c of [{ codec: 'mp4a.40.2', mux: 'aac' }, { codec: 'opus', mux: 'opus' }]) {
+    const cfg = { codec: c.codec, sampleRate, numberOfChannels: 2, bitrate: 160000 };
+    try { const r = await AudioEncoder.isConfigSupported(cfg); if (r && r.supported) return { ...c, cfg }; } catch (e) {}
+  }
+  return null;
+}
+async function getAudioBuffer(key, blob) {
+  if (audioBufferCache.has(key)) return audioBufferCache.get(key);
+  let buf = null;
+  try {
+    const OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+    const dctx = new OAC(2, 1, 48000);
+    const ab = await blob.arrayBuffer();
+    buf = await new Promise((res, rej) => { const p = dctx.decodeAudioData(ab, res, rej); if (p && p.then) p.then(res, rej); });
+  } catch (e) { console.info('no decodable audio in', key, e && e.message); buf = null; }
+  audioBufferCache.set(key, buf);
+  return buf;
+}
+/* Mixes clip audio and music exactly like the preview, but offline and sample-accurate. */
+async function renderAudioOffline(total, sr = 48000) {
+  const OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+  if (!OAC || total <= 0) return null;
+  const octx = new OAC(2, Math.ceil(total * sr), sr);
+  let any = false;
+  for (const { clip, offset } of layout()) {
+    if (clip.kind !== 'video' || clip.volume <= 0) continue;
+    const m = state.media.get(clip.mediaId); if (!m) continue;
+    const buf = await getAudioBuffer(m.id, m.blob); if (!buf) continue;
+    const d = clipDuration(clip), v = effectiveClipVolume(clip);
+    const src = octx.createBufferSource(); src.buffer = buf; src.playbackRate.value = clip.speed;
+    const g = octx.createGain();
+    const edge = Math.min(0.03, d / 4);
+    g.gain.setValueAtTime(0, offset); g.gain.linearRampToValueAtTime(v, offset + edge);
+    g.gain.setValueAtTime(v, offset + d - edge); g.gain.linearRampToValueAtTime(0, offset + d);
+    src.connect(g).connect(octx.destination);
+    src.start(offset, Math.min(clip.start, Math.max(0, buf.duration - 0.01)), Math.max(0.01, clip.end - clip.start));
+    any = true;
+  }
+  const mus = P().music;
+  if (mus && state.musicBlob) {
+    const buf = await getAudioBuffer('music:' + mus.fileId, state.musicBlob);
+    if (buf) {
+      const src = octx.createBufferSource(); src.buffer = buf; src.loop = !!mus.loop;
+      const g = octx.createGain(); const v = clamp(mus.volume, 0, 1);
+      const fi = Math.max(0.01, mus.fadeIn || 0), foStart = Math.max(fi, total - (mus.fadeOut || 0));
+      g.gain.setValueAtTime(0, 0); g.gain.linearRampToValueAtTime(v, fi);
+      g.gain.setValueAtTime(v, foStart); g.gain.linearRampToValueAtTime(0, total);
+      src.connect(g).connect(octx.destination);
+      src.start(0, Math.min(mus.offset || 0, Math.max(0, buf.duration - 0.01)));
+      src.stop(total);
+      any = true;
+    }
+  }
+  if (!any) return null;
+  return await octx.startRendering();
+}
+async function encodeAudio(buffer, enc) {
+  const sr = buffer.sampleRate, ch = buffer.numberOfChannels, total = buffer.length, step = sr;
+  for (let pos = 0; pos < total; pos += step) {
+    if (offline && offline.cancelled) return;
+    const n = Math.min(step, total - pos);
+    const data = new Float32Array(n * 2);
+    for (let c = 0; c < 2; c++) data.set(buffer.getChannelData(Math.min(c, ch - 1)).subarray(pos, pos + n), c * n);
+    const ad = new AudioData({ format: 'f32-planar', sampleRate: sr, numberOfFrames: n, numberOfChannels: 2, timestamp: Math.round(pos / sr * 1e6), data });
+    enc.encode(ad); ad.close();
+    while (enc.encodeQueueSize > 8) await sleep(5);
+  }
+  await enc.flush();
+}
+async function renderFrameOffline(t, cs) {
+  const loc = locate(t);
+  if (!loc) { drawFrameNow(null); return; }
+  if (cs.idx !== loc.idx) {
+    if (loc.idx > 0 && loc.clip.transition.type !== 'none') {
+      const prev = P().clips[loc.idx - 1];
+      const have = state.snapCache.get(prev.id);
+      if (!have || have.width !== W || have.height !== H) { const c = await renderClipLastFrame(prev); if (c) state.snapCache.set(prev.id, c); }
+    }
+    cs.idx = loc.idx;
+  }
+  const m = state.media.get(loc.clip.mediaId);
+  if (loc.clip.kind === 'video' && m) {
+    const st = loc.clip.start + loc.lt * loc.clip.speed;
+    await seekTo(m.el, st);
+    await waitFrame(m.el, 200);
+  }
+  drawFrameNow(loc);
+}
+function setExportStatus(p, text) {
+  $('#exportProgress').style.width = `${Math.round(p * 100)}%`;
+  $('#exportStatus').textContent = text;
+}
+/* @returns true when the file was produced (or cancelled), false to fall back to MediaRecorder. */
+async function startOfflineExport(res, fps) {
+  if (!HAS_WEBCODECS) return false;
+  const bitrate = res >= 1920 ? 12e6 : 6e6;
+  pause();
+  setCanvasSize(res);
+  state.snapCache.clear();
+  const total = totalDuration();
+  const frames = Math.max(1, Math.ceil(total * fps));
+  const vcodec = await pickVideoCodec(W, H, fps, bitrate);
+  if (!vcodec) { setCanvasSize(PREVIEW_LONG); return false; }
+  const acodec = await pickAudioCodec(48000);
+  offline = { cancelled: false };
+  state.exportingOffline = true;
+  keepAwake(true);
+  $('#exportProgressWrap').hidden = false; $('#exportResult').hidden = true; $('#exportStartBtn').disabled = true;
+  let venc = null, aenc = null, err = null;
+  try {
+    const target = new Mp4Muxer.ArrayBufferTarget();
+    const muxer = new Mp4Muxer.Muxer({
+      target,
+      video: { codec: vcodec.mux, width: W, height: H, frameRate: fps },
+      audio: acodec ? { codec: acodec.mux, sampleRate: 48000, numberOfChannels: 2 } : undefined,
+      fastStart: 'in-memory', firstTimestampBehavior: 'offset'
+    });
+    setExportStatus(0, 'Mixing audio…');
+    let audioBuf = null;
+    if (acodec) { try { audioBuf = await renderAudioOffline(total); } catch (e) { console.warn('audio mix failed', e); } }
+    if (offline.cancelled) throw new Error('cancelled');
+    venc = new VideoEncoder({ output: (c, m) => muxer.addVideoChunk(c, m), error: (e) => { err = e; } });
+    venc.configure(vcodec.cfg);
+    const cs = { idx: -1 };
+    const t0 = performance.now();
+    for (let i = 0; i < frames; i++) {
+      if (offline.cancelled) throw new Error('cancelled');
+      if (err) throw err;
+      const t = Math.min(i / fps, Math.max(0, total - 0.0005));
+      await renderFrameOffline(t, cs);
+      const frame = new VideoFrame(canvas, { timestamp: Math.round(i * 1e6 / fps), duration: Math.round(1e6 / fps) });
+      venc.encode(frame, { keyFrame: i % (fps * 2) === 0 });
+      frame.close();
+      while (venc.encodeQueueSize > 4) await sleep(4);
+      if (i % 5 === 0) {
+        const el = (performance.now() - t0) / 1000, eta = el / (i + 1) * (frames - i - 1);
+        setExportStatus(0.05 + 0.85 * i / frames, `Rendering frame ${i + 1} of ${frames} · ${fmt(t)} / ${fmt(total)} · about ${Math.ceil(eta)}s left`);
+      }
+    }
+    await venc.flush(); venc.close(); venc = null;
+    if (acodec && audioBuf) {
+      setExportStatus(0.92, 'Encoding audio…');
+      aenc = new AudioEncoder({ output: (c, m) => muxer.addAudioChunk(c, m), error: (e) => { err = e; } });
+      aenc.configure(acodec.cfg);
+      await encodeAudio(audioBuf, aenc);
+      aenc.close(); aenc = null;
+      if (err) throw err;
+    } else if (acodec) {
+      // No audio at all (silent clips, no music): still finalize a valid file by muxing nothing.
+    }
+    if (offline.cancelled) throw new Error('cancelled');
+    setExportStatus(0.98, 'Writing file…');
+    muxer.finalize();
+    const blob = new Blob([target.buffer], { type: 'video/mp4' });
+    showExportResult(blob, 'mp4', `${vcodec.mux === 'avc' ? 'H.264' : vcodec.mux.toUpperCase()}${acodec ? ' + ' + acodec.mux.toUpperCase() : ''}`);
+  } catch (e) {
+    try { if (venc && venc.state !== 'closed') venc.close(); } catch (x) {}
+    try { if (aenc && aenc.state !== 'closed') aenc.close(); } catch (x) {}
+    if (!(offline && offline.cancelled)) {
+      console.warn('offline export failed', e);
+      toast(`High-quality export failed (${e && e.message ? e.message : e}); using the compatible recorder instead.`, 5000);
+      finishOffline();
+      return false;
+    }
+  }
+  finishOffline();
+  return true;
+}
+function finishOffline() {
+  state.exportingOffline = false;
+  offline = null;
+  keepAwake(false);
+  setCanvasSize(PREVIEW_LONG);
+  state.snapCache.clear();
+  $('#exportStartBtn').disabled = false;
+  setPlayhead(state.playhead);
+}
+function showExportResult(blob, ext, codecLabel) {
+  exportBlob = blob;
+  exportName = `${(P().title.trim() || 'quik-video').replace(/[^\w\-]+/g, '_')}.${ext}`;
+  $('#exportDialog').hidden = false;
+  $('#exportProgressWrap').hidden = true;
+  $('#exportResult').hidden = false;
+  $('#exportResultText').textContent = `Done · ${exportName} · ${(blob.size / 1e6).toFixed(1)} MB · ${fmt(totalDuration())}${codecLabel ? ' · ' + codecLabel : ''}` +
+    (ext === 'webm' && IS_IOS ? ' · This browser could only record WebM, which Photos cannot save; use “Download file” to keep it in Files.' : '');
+  let canShare = false;
+  try { canShare = !!(navigator.canShare && navigator.canShare({ files: [new File([blob], exportName, { type: blob.type })] })); } catch (e) {}
+  $('#exportShareBtn').hidden = !canShare;
+  $('#exportShareBtn').textContent = ext === 'mp4' ? 'Save to Photos / Share…' : 'Share…';
+  $('#exportStartBtn').hidden = true;
+  $('#exportCancelBtn').textContent = 'Close';
+  if (!canShare && !IS_IOS) downloadBlob(blob, exportName);
+  toast(`Exported ${exportName}`, 4000);
+}
+
+/* ======================================================================
+   Export (real-time MediaRecorder fallback)
    ====================================================================== */
 let recorder = null, recChunks = [], exportMime = '', exportBlob = null, exportName = '', wakeLock = null;
 async function keepAwake(on) {
@@ -1096,7 +1330,11 @@ function pickMime() {
 }
 function openExport() {
   if (!P().clips.length) { toast('Nothing to export yet'); return; }
+  if (state.exportingOffline) { $('#exportDialog').hidden = false; return; }
   pause();
+  $('#exportHint').textContent = HAS_WEBCODECS
+    ? 'The video is rendered frame by frame at full quality, with a clean audio mix. A 1‑minute video takes a minute or two. Keep the app open while it renders.'
+    : 'This browser records the preview in real time, so a 1‑minute video takes about a minute. Keep this tab visible while it renders.';
   $('#exportProgressWrap').hidden = true;
   $('#exportResult').hidden = true;
   $('#exportStartBtn').hidden = false; $('#exportStartBtn').disabled = false;
@@ -1104,17 +1342,26 @@ function openExport() {
   $('#exportDialog').hidden = false;
 }
 function closeExport() {
+  if (state.exportingOffline && offline) { offline.cancelled = true; toast('Export cancelled'); }
   if (state.exporting) cancelExport();
   $('#exportDialog').hidden = true;
 }
 // Export frames are drawn by requestAnimationFrame, which browsers pause for hidden tabs.
 document.addEventListener('visibilitychange', () => { if (document.hidden && state.exporting) { cancelExport(); toast('Export stopped because the app went to the background. Keep it open while rendering.', 5000); } });
-function startExport() {
-  const mime = pickMime();
-  if (!mime || !canvas.captureStream) { toast('This browser cannot record video. Try Chrome or Edge.'); return; }
-  ensureAudio();
+async function startExport() {
   const res = $('#exportRes').value === '1080' ? 1920 : 1280;
   const fps = Number($('#exportFps').value) || 30;
+  if (state.exportingOffline || state.exporting) return;
+  if (HAS_WEBCODECS) {
+    const done = await startOfflineExport(res, fps);
+    if (done) return;
+  }
+  startRecorderExport(res, fps);
+}
+function startRecorderExport(res, fps) {
+  const mime = pickMime();
+  if (!mime || !canvas.captureStream) { toast('This browser cannot record video. Try Chrome, Edge or Safari 16.4+.'); return; }
+  ensureAudio();
   pause();
   setCanvasSize(res);
   state.snapCache.clear();
@@ -1127,22 +1374,8 @@ function startExport() {
   recorder.ondataavailable = (e) => { if (e.data && e.data.size) recChunks.push(e.data); };
   recorder.onstop = () => {
     if (!state.exportCancelled && recChunks.length) {
-      exportBlob = new Blob(recChunks, { type: exportMime.split(';')[0] });
-      const ext = exportMime.includes('mp4') ? 'mp4' : 'webm';
-      exportName = `${(P().title.trim() || 'quik-video').replace(/[^\w\-]+/g, '_')}.${ext}`;
-      // Show the result step: on phones "Share" saves straight to Photos; elsewhere download.
-      $('#exportDialog').hidden = false;
-      $('#exportProgressWrap').hidden = true;
-      $('#exportResult').hidden = false;
-      $('#exportResultText').textContent = `Done · ${exportName} · ${(exportBlob.size / 1e6).toFixed(1)} MB · ${fmt(totalDuration())}` +
-        (ext === 'webm' && IS_IOS ? ' · This browser could only record WebM, which Photos cannot save; use “Download file” to keep it in Files.' : '');
-      const canShare = !!(navigator.canShare && navigator.canShare({ files: [new File([exportBlob], exportName, { type: exportBlob.type })] }));
-      $('#exportShareBtn').hidden = !canShare;
-      $('#exportShareBtn').textContent = ext === 'mp4' ? 'Save to Photos / Share…' : 'Share…';
-      $('#exportStartBtn').hidden = true;
-      $('#exportCancelBtn').textContent = 'Close';
-      if (!canShare && !IS_IOS) downloadBlob(exportBlob, exportName);
-      toast(`Exported ${exportName}`, 4000);
+      const blob = new Blob(recChunks, { type: exportMime.split(';')[0] });
+      showExportResult(blob, exportMime.includes('mp4') ? 'mp4' : 'webm', 'recorded live');
     }
     recChunks = [];
   };
@@ -1747,5 +1980,5 @@ window.addEventListener('error', (e) => { if (e && e.message) toast(`Error: ${e.
 window.addEventListener('unhandledrejection', (e) => { const r = e && e.reason; toast(`Error: ${r && r.message ? r.message : r}`, 6000); });
 
 /* Exposed for debugging / tests */
-window.QuikWeb = { state, importFiles, addToTimeline, autoCreate, applyTheme, beatSync, play, pause, setPlayhead, renderAt, totalDuration, layout, setMusic, splitAtPlayhead, startExport, pickMime, useLibraryTrack, loadLibrary };
+window.QuikWeb = { HAS_WEBCODECS, startOfflineExport, state, importFiles, addToTimeline, autoCreate, applyTheme, beatSync, play, pause, setPlayhead, renderAt, totalDuration, layout, setMusic, splitAtPlayhead, startExport, pickMime, useLibraryTrack, loadLibrary };
 })();
