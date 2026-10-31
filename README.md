@@ -15,6 +15,24 @@ python3 -m http.server 8000
 # then open http://localhost:8000
 ```
 
+## Use it on your iPhone
+
+The editor runs in Safari on iOS 17 or newer (iOS 18+ gives the best results: colour filters
+are rendered natively there). It needs to be served over HTTPS, which GitHub Pages provides for free:
+
+1. In this repository open **Settings → Pages** and set **Source** to **GitHub Actions**. The included
+   workflow (`.github/workflows/pages.yml`) publishes the app on every push.
+2. Open `https://<your-github-user>.github.io/<repo-name>/` on the phone (for this repo:
+   `https://ittaymiz.github.io/empty-repo/`).
+3. Tap **Share → Add to Home Screen**. The app then opens full screen like a native app and works offline.
+4. **Media** tab → **+ Add** picks videos and photos from your Photos library. Tap **Auto Create**,
+   then use the **Clip / Style / Text / Music / Theme** tabs to edit.
+5. **Export** renders the video. When it is done, tap **Save to Photos / Share…**, then **Save Video**.
+   Keep the app in the foreground while it renders (the screen is kept awake automatically).
+
+On the phone the timeline is scrubbed by dragging on the time ruler; clips are reordered with the
+**Move earlier / Move later** buttons in the Clip tab (or long-press and drag). Safari exports MP4 (H.264).
+
 ## Features
 
 | Area | What you can do |
@@ -59,5 +77,6 @@ Rendering uses an HTML canvas, so export runs in real time through `MediaRecorde
 ## Known limitations
 
 - Export is WebM in Chrome/Edge/Firefox. Safari produces MP4 when `MediaRecorder` supports it. WebM files recorded in the browser carry no duration header; players still play them, and tools such as ffmpeg can remux them if needed.
+- On iPhone, Safari limits how much video memory a page may use. Very long 4K clips can be slow; shorter or 1080p clips work best.
 - Reverse playback is not available (browsers cannot play video backwards).
 - Exported audio comes from the browser's live mix, so keep the tab in the foreground during export.

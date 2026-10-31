@@ -17,7 +17,9 @@ body {
   font: 14px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   overflow: hidden;
 }
-#app { display: grid; grid-template-rows: 52px 1fr 190px; height: 100vh; }
+#app { display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: 52px 1fr 190px; height: 100vh; height: 100dvh; width: 100vw; overflow: hidden; }
+.mobile-only { display: none; }
+.sep { border: 0; border-top: 1px solid var(--border); margin: 14px 0; }
 button, select, input, textarea { font: inherit; color: inherit; }
 button { cursor: pointer; }
 .spacer { flex: 1; }
@@ -139,11 +141,12 @@ button:disabled { opacity: 0.5; cursor: default; filter: none; }
 .timeline-head input[type=range] { width: 100px; vertical-align: middle; }
 .timeline-scroll { flex: 1; overflow-x: auto; overflow-y: hidden; position: relative; }
 .timeline { position: relative; min-width: 100%; height: 100%; padding: 0 12px; }
-.ruler { position: relative; height: 22px; border-bottom: 1px solid var(--border); cursor: pointer; user-select: none; }
+.ruler { position: relative; height: 22px; border-bottom: 1px solid var(--border); cursor: pointer; user-select: none; touch-action: none; }
 .ruler .tick { position: absolute; top: 0; height: 100%; border-left: 1px solid var(--border); font-size: 10px; color: var(--muted); padding-left: 3px; line-height: 22px; }
 .ruler .beat { position: absolute; bottom: 0; width: 2px; height: 6px; background: var(--accent-2); }
 .clips { display: flex; gap: 4px; padding: 8px 0 4px; height: 92px; align-items: stretch; }
 .clip {
+  -webkit-touch-callout: none; user-select: none;
   position: relative; border-radius: 8px; overflow: hidden; background: #000 center/cover no-repeat;
   border: 2px solid transparent; cursor: pointer; flex-shrink: 0; min-width: 28px;
 }
@@ -173,10 +176,41 @@ button:disabled { opacity: 0.5; cursor: default; filter: none; }
 @media (max-width: 1000px) {
   .workspace { grid-template-columns: 200px 1fr 260px; }
 }
-@media (max-width: 760px) {
-  #app { grid-template-rows: 52px 1fr 170px; }
-  .workspace { grid-template-columns: 1fr; grid-template-rows: 1fr auto; }
+/* Phones: preview on top, timeline, then a tabbed panel (Media / Clip / Style / Text / Music / Theme). */
+@media (max-width: 760px), (pointer: coarse) and (max-height: 500px) {
+  #app { grid-template-rows: 48px auto 118px 1fr; padding-top: env(safe-area-inset-top); }
+  .topbar { padding: 0 10px; gap: 6px; }
+  .topbar .sub, .title-input, #newProjectBtn { display: none; }
+  .topbar select { width: auto; padding: 6px 4px; font-size: 12px; }
+  .workspace { display: contents; }
   .media-panel { display: none; }
-  .inspector { max-height: 40vh; border-left: 0; border-top: 1px solid var(--border); }
-  .title-input { display: none; }
+  .mobile-only { display: block; }
+  .tab.mobile-only { display: block; }
+  .media-page .media-panel { display: flex; border: 0; height: 100%; }
+  .media-page { padding: 0; display: none; }
+  .media-page.active { display: flex; flex-direction: column; }
+  .media-page .media-grid { grid-template-columns: repeat(3, 1fr); }
+  .preview-area { grid-row: 2; max-height: 42vh; max-height: 42dvh; min-width: 0; }
+  .inspector, .timeline-panel { min-width: 0; }
+  .preview-wrap { padding: 8px; }
+  #preview { max-height: calc(42vh - 70px); max-height: calc(42dvh - 70px); }
+  .transport { padding: 6px 8px; gap: 6px; flex-wrap: wrap; }
+  .transport .time { font-size: 12px; margin-left: 0; }
+  .empty-hint .big { font-size: 26px; }
+  .empty-hint p { font-size: 12px; padding: 0 20px; }
+  .timeline-panel { order: 2; grid-row: 3; }
+  .timeline-head span.small-text { display: none; }
+  .timeline-head { padding: 2px 10px; }
+  .clips { height: 62px; padding: 6px 0 2px; }
+  .clip .label { font-size: 9px; }
+  .music-track { height: 16px; }
+  .music-bar { height: 14px; line-height: 14px; font-size: 9px; }
+  .inspector { order: 3; grid-row: 4; border-left: 0; border-top: 1px solid var(--border); min-height: 0; padding-bottom: env(safe-area-inset-bottom); }
+  .tabs { overflow-x: auto; }
+  .tab { padding: 10px 6px; font-size: 13px; min-width: 56px; }
+  .tab-page { padding: 10px 12px; }
+  .filter-grid { grid-template-columns: repeat(4, 1fr); }
+  .toast { bottom: auto; top: 60px; }
+  .modal-card { width: 94vw; }
+  input[type=range] { height: 28px; }
 }
