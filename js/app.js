@@ -163,10 +163,14 @@ function thumbFrom(source, w, h, size = 200) {
 
 async function loadVideoMedia(entry) {
   const el = document.createElement('video');
-  el.preload = 'auto'; el.playsInline = true; el.muted = false; el.src = entry.url;
+  // Starts muted: iOS only decodes a muted video before the user has tapped play.
+  // unlockMedia() unmutes it inside the first play gesture.
+  el.preload = 'auto'; el.playsInline = true; el.muted = true; el.setAttribute('muted', ''); el.setAttribute('playsinline', ''); el.src = entry.url;
   await new Promise((res, rej) => {
-    el.addEventListener('loadedmetadata', res, { once: true });
-    el.addEventListener('error', () => rej(new Error('Cannot decode ' + entry.name)), { once: true });
+    const timer = setTimeout(() => rej(new Error('timed out while reading the video')), 25000);
+    el.addEventListener('loadedmetadata', () => { clearTimeout(timer); res(); }, { once: true });
+    el.addEventListener('error', () => { clearTimeout(timer); rej(new Error('the browser cannot play this video format')); }, { once: true });
+    try { el.load(); } catch (e) {}
   });
   // WebM files recorded by MediaRecorder report an infinite duration until seeked to the end.
   if (!isFinite(el.duration)) {
@@ -195,11 +199,30 @@ async function loadVideoMedia(entry) {
 
 async function loadImageMedia(entry) {
   const img = new Image();
-  img.src = entry.url;
-  await img.decode().catch(() => new Promise(res => { img.onload = res; img.onerror = res; }));
-  entry.el = img; entry.duration = 0;
-  entry.w = img.naturalWidth || 1280; entry.h = img.naturalHeight || 720;
-  entry.thumb = thumbFrom(img, entry.w, entry.h);
+  await new Promise((res, rej) => {
+    let settled = false;
+    const ok = () => { if (!settled) { settled = true; clearTimeout(timer); res(); } };
+    const bad = (why) => { if (!settled) { settled = true; clearTimeout(timer); rej(new Error(why)); } };
+    const timer = setTimeout(() => img.naturalWidth ? ok() : bad('timed out while reading the photo'), 25000);
+    img.onload = ok;
+    img.onerror = () => bad('the browser cannot decode this photo format');
+    img.src = entry.url;
+    if (img.complete && img.naturalWidth) ok();
+  });
+  // decode() is best effort only: Safari rejects it for very large photos even though the image is usable.
+  try { await img.decode(); } catch (e) {}
+  if (!img.naturalWidth) throw new Error('the photo has no readable pixels');
+  entry.w = img.naturalWidth; entry.h = img.naturalHeight; entry.duration = 0;
+  // Phones take 12–48 MP photos; drawing those every frame is slow and memory hungry, so keep a ≤2048px copy.
+  const MAX = 2048;
+  if (Math.max(entry.w, entry.h) > MAX) {
+    const k = MAX / Math.max(entry.w, entry.h);
+    const c = document.createElement('canvas');
+    c.width = Math.round(entry.w * k); c.height = Math.round(entry.h * k);
+    c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+    entry.el = c; entry.w = c.width; entry.h = c.height;
+  } else entry.el = img;
+  entry.thumb = thumbFrom(entry.el, entry.w, entry.h);
 }
 
 async function loadMedia(entry) {
@@ -209,25 +232,40 @@ async function loadMedia(entry) {
   return entry;
 }
 
+/* Photos pickers on phones sometimes hand over files with an empty MIME type; fall back to the extension. */
+function mediaKind(file) {
+  const t = (file.type || '').toLowerCase();
+  if (t.startsWith('video/')) return 'video';
+  if (t.startsWith('image/')) return 'image';
+  const ext = (file.name || '').toLowerCase().split('.').pop();
+  if (['mov', 'mp4', 'm4v', 'webm', 'mkv', 'avi', '3gp', 'hevc'].includes(ext)) return 'video';
+  if (['jpg', 'jpeg', 'png', 'heic', 'heif', 'webp', 'gif', 'bmp', 'avif', 'tif', 'tiff'].includes(ext)) return 'image';
+  return null;
+}
 async function importFiles(files) {
-  const list = Array.from(files).filter(f => f.type.startsWith('video/') || f.type.startsWith('image/'));
-  if (!list.length) { toast('No videos or photos found in the selection'); return []; }
-  toast(`Importing ${list.length} file${list.length > 1 ? 's' : ''}…`, 60000);
-  const added = [];
-  for (const file of list) {
-    const entry = { id: uid(), kind: file.type.startsWith('video/') ? 'video' : 'image', name: file.name, blob: file };
+  const all = Array.from(files || []);
+  const list = all.filter(f => mediaKind(f));
+  if (!list.length) { toast(all.length ? `Unsupported file type: ${all[0].name}` : 'No files were selected', 4000); return []; }
+  const added = [], failed = [];
+  for (let i = 0; i < list.length; i++) {
+    const file = list[i];
+    toast(`Importing ${i + 1}/${list.length}: ${file.name}…`, 60000);
+    const entry = { id: uid(), kind: mediaKind(file), name: file.name || `file-${i + 1}`, blob: file };
     try {
       await loadMedia(entry);
-      await DB.putFile(entry.id, file);
       added.push(entry);
+      // Persist for reloads, but never let a slow or broken IndexedDB block the import.
+      Promise.race([DB.putFile(entry.id, file), new Promise(r => setTimeout(r, 8000))]).catch(() => {});
+      renderMediaGrid();
     } catch (e) {
-      console.warn(e);
-      toast(`Could not open ${file.name}`);
+      console.warn('import failed', file.name, e);
+      failed.push(`${file.name}: ${e && e.message ? e.message : e}`);
     }
   }
   renderMediaGrid();
   save();
-  if (added.length) toast(`Added ${added.length} file${added.length > 1 ? 's' : ''} to the media bin`);
+  if (failed.length) toast(`Could not open ${failed.length} file${failed.length > 1 ? 's' : ''} – ${failed[0]}`, 7000);
+  else if (added.length) toast(`Added ${added.length} file${added.length > 1 ? 's' : ''} to the media bin`);
   return added;
 }
 
@@ -284,8 +322,8 @@ function unlockMedia() {
     unlockedEls.add(el);
     // Play silently, then pause again unless playback has meanwhile started on this element.
     const g = gainFor.get(el);
-    const savedGain = g ? g.gain.value : null, savedMuted = el.muted;
-    if (g) g.gain.value = 0; else el.muted = true;
+    const savedGain = g ? g.gain.value : null, savedMuted = false;
+    if (g) { g.gain.value = 0; el.muted = false; } else el.muted = true;
     const restore = () => {
       const active = state.playing && activeIdx >= 0 && P().clips[activeIdx] ? state.media.get(P().clips[activeIdx].mediaId) : null;
       const keep = (el === musicEl && state.playing && P().music) || (active && active.el === el);
@@ -1597,6 +1635,9 @@ async function boot() {
   if (state.media.size) toast('Welcome back – your project was restored');
 }
 boot();
+
+window.addEventListener('error', (e) => { if (e && e.message) toast(`Error: ${e.message}`, 6000); });
+window.addEventListener('unhandledrejection', (e) => { const r = e && e.reason; toast(`Error: ${r && r.message ? r.message : r}`, 6000); });
 
 /* Exposed for debugging / tests */
 window.QuikWeb = { state, importFiles, addToTimeline, autoCreate, applyTheme, beatSync, play, pause, setPlayhead, renderAt, totalDuration, layout, setMusic, splitAtPlayhead, startExport, pickMime };
