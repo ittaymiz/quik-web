@@ -375,6 +375,8 @@
 </div>
 
 <script src="js/vendor/mp4-muxer.js"></script>
+<!-- mediabunny (MPL-2.0, unmodified) is used only for demuxing/decoding audio during export; loaded lazily as a module. -->
+<script type="module">import * as MB from "./js/vendor/mediabunny.min.mjs"; window.Mediabunny = MB;</script>
 <script src="js/db.js"></script>
 <script src="js/beats.js"></script>
 <script src="js/presets.js"></script>

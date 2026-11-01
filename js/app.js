@@ -19,7 +19,7 @@ const fmt = (s) => {
 };
 const ASPECTS = { '16:9': [16, 9], '9:16': [9, 16], '1:1': [1, 1], '4:5': [4, 5] };
 const PREVIEW_LONG = window.matchMedia('(max-width: 760px)').matches ? 960 : 1280;
-const MIN_CLIP = 0.2;
+const MIN_CLIP = 1.0;
 const IS_IOS = /iP(hone|ad|od)/.test(navigator.platform) || (navigator.userAgent.includes('Mac') && 'ontouchend' in document);
 const HAS_CTX_FILTER = (() => { try { const c = document.createElement('canvas').getContext('2d'); return typeof c.filter === 'string'; } catch (e) { return false; } })();
 const phoneLayout = window.matchMedia('(max-width: 760px), (pointer: coarse) and (max-height: 500px)');
@@ -1129,7 +1129,7 @@ function planEdit(target) {
       videos.forEach(m => {
         const share = videoBudget * m.duration / totalSrc;
         const k = Math.max(1, Math.round(share / pace));
-        const segLen = clamp(share / k, 0.8, m.duration);
+        const segLen = clamp(share / k, Math.min(AUTO_MIN_CLIP, m.duration), m.duration);
         const margin = Math.min(m.duration * 0.05, 1);
         const usable = Math.max(segLen, m.duration - 2 * margin);
         for (let j = 0; j < k; j++) {
@@ -1170,10 +1170,10 @@ function fitToLength(target, { silent = false } = {}) {
   const f = target / total;
   P().clips.forEach(c => {
     const m = state.media.get(c.mediaId);
-    if (c.kind === 'image') c.imageDuration = clamp(c.imageDuration * f, 1, 6);
+    if (c.kind === 'image') c.imageDuration = clamp(c.imageDuration * f, 2, 6);
     else if (m) {
-      const want = clipDuration(c) * f;
       const maxDur = (maxEndFor(c) - c.start) / c.speed;   // never beyond the clip's own footage
+      const want = Math.max(Math.min(AUTO_MIN_CLIP, maxDur), clipDuration(c) * f);
       c.end = c.start + Math.min(want, maxDur) * c.speed;
     }
     c.transition.duration = Math.min(c.transition.duration, Math.max(0.2, clipDuration(c) / 2));
@@ -1251,21 +1251,23 @@ function beatSync({ silent = false, noUndo = false, target = null } = {}) {
   let t = 0;
   P().clips.forEach(c => {
     const m = state.media.get(c.mediaId);
-    const want = target ? clipDuration(c) * scale : pace;
+    const avail = c.kind === 'image' ? 15 : (m ? (maxEndFor(c) - c.start) / c.speed : 0);
+    const minLen = Math.min(AUTO_MIN_CLIP, Math.max(0.3, avail));
+    const want = Math.max(minLen, target ? clipDuration(c) * scale : pace);
     const desired = t + want;
     let best = null, bestD = Infinity;
     for (const b of beats) {
-      if (b < t + Math.max(0.5, want * 0.5)) continue;
+      if (b < t + Math.max(minLen, want * 0.5)) continue;
       const d = Math.abs(b - desired);
       if (d < bestD) { bestD = d; best = b; }
       if (b > desired + want) break;
     }
     let dur = best !== null ? best - t : want;
-    if (c.kind === 'image') c.imageDuration = clamp(dur, 0.5, 6);
+    if (c.kind === 'image') c.imageDuration = clamp(dur, 2, 6);
     else if (m) {
       const maxDur = (maxEndFor(c) - c.start) / c.speed;
       dur = Math.min(dur, maxDur);
-      if (dur < 0.4) dur = Math.min(maxDur, want);
+      if (dur < minLen) dur = Math.min(maxDur, Math.max(want, minLen));
       c.end = Math.min(m.duration, c.start + dur * c.speed);
     }
     const cd = clipDuration(c);
@@ -1451,40 +1453,139 @@ async function pickAudioCodec(sampleRate) {
   }
   return null;
 }
+/* ---------- Audio sources for export ----------
+   1. decodeAudioData (fast; Chrome/Firefox, and audio-only files in Safari)
+   2. mediabunny demux + WebCodecs AudioDecoder (Safari with .mov/.mp4 video files)
+   3. real-time capture through Web Audio while the clip plays silently (works everywhere) */
+const MB = () => window.Mediabunny || null;
+const audioFallback = { decode: false, encode: false };   // test hooks: force the fallback paths
+async function decodeViaWebAudio(blob) {
+  const OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+  const dctx = new OAC(2, 1, 48000);
+  const ab = await blob.arrayBuffer();
+  return await new Promise((res, rej) => { const p = dctx.decodeAudioData(ab, res, rej); if (p && p.then) p.then(res, rej); });
+}
+/* Returns { buffer } or { none: true } when the file has no audio track, or null when it could not decode. */
+async function decodeViaMediabunny(blob) {
+  const mb = MB(); if (!mb) return null;
+  let input = null;
+  try {
+    input = new mb.Input({ source: new mb.BlobSource(blob), formats: mb.ALL_FORMATS });
+    const track = await input.getPrimaryAudioTrack();
+    if (!track) return { none: true };
+    if (!(await track.canDecode())) return null;
+    const sink = new mb.AudioBufferSink(track);
+    const parts = []; let end = 0, sr = 48000, ch = 2;
+    for await (const w of sink.buffers()) { parts.push(w); end = Math.max(end, w.timestamp + w.duration); sr = w.buffer.sampleRate; ch = w.buffer.numberOfChannels; }
+    if (!parts.length) return { none: true };
+    const OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+    const out = new OAC(ch, 1, sr).createBuffer(ch, Math.ceil(end * sr) + 1, sr);
+    for (const w of parts) {
+      const off = Math.round(w.timestamp * sr);
+      for (let c = 0; c < ch; c++) out.getChannelData(c).set(w.buffer.getChannelData(Math.min(c, w.buffer.numberOfChannels - 1)).subarray(0, Math.max(0, out.length - off)), off);
+    }
+    return { buffer: out };
+  } catch (e) { console.info('mediabunny decode failed', e && e.message); return null; }
+  finally { try { input && input.dispose && input.dispose(); } catch (e) {} }
+}
 async function getAudioBuffer(key, blob) {
   if (audioBufferCache.has(key)) return audioBufferCache.get(key);
-  let buf = null;
-  try {
-    const OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
-    const dctx = new OAC(2, 1, 48000);
-    const ab = await blob.arrayBuffer();
-    buf = await new Promise((res, rej) => { const p = dctx.decodeAudioData(ab, res, rej); if (p && p.then) p.then(res, rej); });
-  } catch (e) { console.info('no decodable audio in', key, e && e.message); buf = null; }
+  let buf = null, info = 'decoded';
+  if (!audioFallback.decode) { try { buf = await decodeViaWebAudio(blob); } catch (e) { buf = null; } }
+  if (!buf) {
+    const r = await decodeViaMediabunny(blob);
+    if (r && r.buffer) { buf = r.buffer; info = 'decoded (mediabunny)'; }
+    else if (r && r.none) { info = 'no audio track'; audioBufferCache.set(key, null); audioNoTrack.add(key); return null; }
+    else info = 'undecodable';
+  }
+  console.info('audio', key, info);
   audioBufferCache.set(key, buf);
   return buf;
 }
-/* Mixes clip audio and music exactly like the preview, but offline and sample-accurate. */
-async function renderAudioOffline(total, sr = 48000) {
+const audioNoTrack = new Set();
+let capSrc = null;
+/* Plays [start,end] of a clip's file silently through the audio graph and records the PCM. */
+async function captureElementAudio(m, start, end, speed, onProgress) {
+  ensureAudio();
+  if (!actx || typeof actx.createScriptProcessor !== 'function') return null;
+  await bind(scratch, m);
+  const el = scratch.el;
+  if (!capSrc) { try { capSrc = actx.createMediaElementSource(el); } catch (e) { return null; } }
+  const proc = actx.createScriptProcessor(4096, 2, 2);
+  const mute = actx.createGain(); mute.gain.value = 0;
+  capSrc.connect(proc); proc.connect(mute); mute.connect(actx.destination);
+  const L = [], R = []; let collecting = false;
+  proc.onaudioprocess = (e) => {
+    if (!collecting) return;
+    const ib = e.inputBuffer;
+    L.push(new Float32Array(ib.getChannelData(0)));
+    R.push(new Float32Array(ib.getChannelData(Math.min(1, ib.numberOfChannels - 1))));
+  };
+  const expected = Math.max(0.05, (end - start) / Math.max(0.0625, speed));
+  el.muted = false; el.playbackRate = clamp(speed, 0.0625, 16);
+  await seekTo(el, start);
+  await new Promise((res) => {
+    let finished = false;
+    const done = () => { if (finished) return; finished = true; collecting = false; el.pause(); clearInterval(iv); clearTimeout(guard); res(); };
+    const iv = setInterval(() => { if (el.currentTime >= end - 0.03 || el.ended) done(); else if (onProgress) onProgress(clamp((el.currentTime - start) / Math.max(0.01, end - start), 0, 1)); }, 20);
+    const guard = setTimeout(done, (expected + 4) * 1000);
+    el.addEventListener('playing', () => { collecting = true; }, { once: true });
+    el.play().catch(() => done());
+  });
+  el.muted = true;
+  try { capSrc.disconnect(proc); proc.disconnect(); mute.disconnect(); } catch (e) {}
+  const n = L.reduce((a, c) => a + c.length, 0);
+  if (!n) return null;
+  const sr = actx.sampleRate;
+  const len = Math.min(n, Math.round(expected * sr));
+  const buf = actx.createBuffer(2, Math.max(1, len), sr);
+  let pos = 0;
+  for (let i = 0; i < L.length && pos < len; i++) {
+    const take = Math.min(L[i].length, len - pos);
+    buf.getChannelData(0).set(L[i].subarray(0, take), pos);
+    buf.getChannelData(1).set(R[i].subarray(0, take), pos);
+    pos += take;
+  }
+  return buf;
+}
+/* Mixes clip audio and music exactly like the preview, but offline and sample-accurate.
+   Returns { buffer, notes } (buffer null when there is no audio at all). */
+async function renderAudioOffline(total, onStatus, sr = 48000) {
   const OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
-  if (!OAC || total <= 0) return null;
+  if (!OAC || total <= 0) return { buffer: null, notes: ['no offline audio support'] };
   const octx = new OAC(2, Math.ceil(total * sr), sr);
-  let any = false;
-  for (const { clip, offset } of layout()) {
+  let any = false; const notes = []; let captured = 0, decoded = 0;
+  const items = layout();
+  for (let i = 0; i < items.length; i++) {
+    const { clip, offset } = items[i];
     if (clip.kind !== 'video' || clip.volume <= 0) continue;
     const m = state.media.get(clip.mediaId); if (!m) continue;
-    const buf = await getAudioBuffer(m.id, m.blob); if (!buf) continue;
+    if (onStatus) onStatus(`Preparing audio ${i + 1}/${items.length}…`);
     const d = clipDuration(clip), v = effectiveClipVolume(clip);
-    const src = octx.createBufferSource(); src.buffer = buf; src.playbackRate.value = clip.speed;
+    let buf = await getAudioBuffer(m.id, m.blob);
+    let src;
+    if (buf) {
+      src = octx.createBufferSource(); src.buffer = buf; src.playbackRate.value = clip.speed;
+      decoded++;
+    } else if (!audioNoTrack.has(m.id)) {
+      // Could not decode the file: capture this segment live (takes as long as the segment).
+      const cap = await captureElementAudio(m, clip.start, clip.end, clip.speed, (p) => onStatus && onStatus(`Capturing audio ${i + 1}/${items.length} · ${Math.round(p * 100)}%`));
+      if (!cap) continue;
+      src = octx.createBufferSource(); src.buffer = cap;
+      captured++;
+    } else continue;
     const g = octx.createGain();
     const edge = Math.min(0.03, d / 4);
     g.gain.setValueAtTime(0, offset); g.gain.linearRampToValueAtTime(v, offset + edge);
     g.gain.setValueAtTime(v, offset + d - edge); g.gain.linearRampToValueAtTime(0, offset + d);
     src.connect(g).connect(octx.destination);
-    src.start(offset, Math.min(clip.start, Math.max(0, buf.duration - 0.01)), Math.max(0.01, clip.end - clip.start));
+    if (buf) src.start(offset, Math.min(clip.start, Math.max(0, buf.duration - 0.01)), Math.max(0.01, clip.end - clip.start));
+    else src.start(offset, 0, d);
     any = true;
   }
   const mus = P().music;
   if (mus && state.musicBlob) {
+    if (onStatus) onStatus('Preparing music…');
     const buf = await getAudioBuffer('music:' + mus.fileId, state.musicBlob);
     if (buf) {
       const src = octx.createBufferSource(); src.buffer = buf; src.loop = !!mus.loop;
@@ -1495,11 +1596,54 @@ async function renderAudioOffline(total, sr = 48000) {
       src.connect(g).connect(octx.destination);
       src.start(0, Math.min(mus.offset || 0, Math.max(0, buf.duration - 0.01)));
       src.stop(total);
-      any = true;
-    }
+      any = true; notes.push('music');
+    } else notes.push('music could not be decoded');
   }
-  if (!any) return null;
-  return await octx.startRendering();
+  if (decoded) notes.push(`${decoded} clip${decoded > 1 ? 's' : ''} decoded`);
+  if (captured) notes.push(`${captured} clip${captured > 1 ? 's' : ''} captured live`);
+  if (!any) return { buffer: null, notes: notes.length ? notes : ['no audio in the clips'] };
+  if (onStatus) onStatus('Mixing audio…');
+  return { buffer: await octx.startRendering(), notes };
+}
+/* Encodes the mix without WebCodecs: records it with MediaRecorder in real time, then pulls the
+   compressed packets back out with mediabunny so they can be muxed next to the video. */
+async function encodeMixWithRecorder(audioBuf, onStatus) {
+  const mb = MB();
+  if (!mb || !window.MediaRecorder) return null;
+  ensureAudio(); if (!actx) return null;
+  const mimes = ['audio/mp4;codecs=mp4a.40.2', 'audio/mp4', 'audio/webm;codecs=opus', 'audio/webm'];
+  const mime = mimes.find(x => { try { return MediaRecorder.isTypeSupported(x); } catch (e) { return false; } });
+  if (!mime) return null;
+  const dest = actx.createMediaStreamDestination();
+  const src = actx.createBufferSource(); src.buffer = audioBuf; src.connect(dest);
+  const rec = new MediaRecorder(dest.stream, { mimeType: mime, audioBitsPerSecond: 160000 });
+  const chunks = [];
+  rec.ondataavailable = (e) => { if (e.data && e.data.size) chunks.push(e.data); };
+  const stopped = new Promise(r => { rec.onstop = r; });
+  const t0 = performance.now();
+  rec.start();
+  await sleep(60);
+  src.start();
+  await new Promise(r => {
+    src.onended = r;
+    const iv = setInterval(() => { if (onStatus) onStatus(`Encoding audio (recorder) · ${fmt(Math.min(audioBuf.duration, (performance.now() - t0) / 1000))} / ${fmt(audioBuf.duration)}`); if (offline && offline.cancelled) { clearInterval(iv); r(); } }, 250);
+    src.onended = () => { clearInterval(iv); r(); };
+  });
+  await sleep(200);
+  rec.stop(); await stopped;
+  const blob = new Blob(chunks, { type: mime.split(';')[0] });
+  const input = new mb.Input({ source: new mb.BlobSource(blob), formats: mb.ALL_FORMATS });
+  try {
+    const track = await input.getPrimaryAudioTrack();
+    if (!track) return null;
+    const codec = track.codec === 'aac' ? 'aac' : track.codec === 'opus' ? 'opus' : null;
+    if (!codec) return null;
+    const decoderConfig = await track.getDecoderConfig();
+    const packets = [];
+    const sink = new mb.EncodedPacketSink(track);
+    for await (const pk of sink.packets()) packets.push({ data: pk.data, type: pk.type, timestamp: pk.timestamp, duration: pk.duration });
+    return { codec, decoderConfig, packets, sampleRate: track.sampleRate || decoderConfig.sampleRate, channels: track.numberOfChannels || decoderConfig.numberOfChannels };
+  } finally { try { input.dispose && input.dispose(); } catch (e) {} }
 }
 async function encodeAudio(buffer, enc) {
   const sr = buffer.sampleRate, ch = buffer.numberOfChannels, total = buffer.length, step = sr;
@@ -1550,24 +1694,47 @@ async function startOfflineExport(res, fps) {
   const frames = Math.max(1, Math.ceil(total * fps));
   const vcodec = await pickVideoCodec(W, H, fps, bitrate);
   if (!vcodec) { setCanvasSize(PREVIEW_LONG); return false; }
-  const acodec = await pickAudioCodec(48000);
   offline = { cancelled: false };
   state.exportingOffline = true;
   keepAwake(true);
   $('#exportProgressWrap').hidden = false; $('#exportResult').hidden = true; $('#exportStartBtn').disabled = true;
   let venc = null, aenc = null, err = null;
   try {
+    // ---- 1. Audio first: mix, then encode (WebCodecs AAC/Opus, or the recorder + demux fallback)
+    setExportStatus(0.01, 'Preparing audio…');
+    const mix = await renderAudioOffline(total, (txt) => setExportStatus(0.02, txt));
+    if (offline.cancelled) throw new Error('cancelled');
+    let audioTrack = null;       // { codec, sampleRate, channels, add: (muxer) => void, label }
+    if (mix.buffer) {
+      const acodec = audioFallback.encode ? null : await pickAudioCodec(48000);
+      if (acodec) {
+        setExportStatus(0.04, 'Encoding audio…');
+        const chunks = [];
+        aenc = new AudioEncoder({ output: (c, m) => chunks.push([c, m]), error: (e) => { err = e; } });
+        aenc.configure(acodec.cfg);
+        await encodeAudio(mix.buffer, aenc);
+        aenc.close(); aenc = null;
+        if (err) throw err;
+        audioTrack = { codec: acodec.mux, sampleRate: 48000, channels: 2, label: acodec.mux.toUpperCase(), add: (mx) => chunks.forEach(([c, m]) => mx.addAudioChunk(c, m)) };
+      } else {
+        const r = await encodeMixWithRecorder(mix.buffer, (txt) => setExportStatus(0.04, txt));
+        if (offline.cancelled) throw new Error('cancelled');
+        if (r && r.packets.length) {
+          audioTrack = { codec: r.codec, sampleRate: r.sampleRate, channels: r.channels, label: r.codec.toUpperCase() + ' (recorder)',
+            add: (mx) => r.packets.forEach((pk, i) => mx.addAudioChunkRaw(pk.data, pk.type, Math.round(pk.timestamp * 1e6), Math.round(pk.duration * 1e6), i === 0 ? { decoderConfig: r.decoderConfig } : undefined)) };
+        } else mix.notes.push('audio could not be encoded in this browser');
+      }
+    }
+    // ---- 2. Muxer with the final track layout
     const target = new Mp4Muxer.ArrayBufferTarget();
     const muxer = new Mp4Muxer.Muxer({
       target,
       video: { codec: vcodec.mux, width: W, height: H, frameRate: fps },
-      audio: acodec ? { codec: acodec.mux, sampleRate: 48000, numberOfChannels: 2 } : undefined,
+      audio: audioTrack ? { codec: audioTrack.codec, sampleRate: audioTrack.sampleRate, numberOfChannels: audioTrack.channels } : undefined,
       fastStart: 'in-memory', firstTimestampBehavior: 'offset'
     });
-    setExportStatus(0, 'Mixing audio…');
-    let audioBuf = null;
-    if (acodec) { try { audioBuf = await renderAudioOffline(total); } catch (e) { console.warn('audio mix failed', e); } }
-    if (offline.cancelled) throw new Error('cancelled');
+    if (audioTrack) audioTrack.add(muxer);
+    // ---- 3. Video, frame by frame
     venc = new VideoEncoder({ output: (c, m) => muxer.addVideoChunk(c, m), error: (e) => { err = e; } });
     venc.configure(vcodec.cfg);
     const cs = { idx: -1 };
@@ -1583,25 +1750,17 @@ async function startOfflineExport(res, fps) {
       while (venc.encodeQueueSize > 4) await sleep(4);
       if (i % 5 === 0) {
         const el = (performance.now() - t0) / 1000, eta = el / (i + 1) * (frames - i - 1);
-        setExportStatus(0.05 + 0.85 * i / frames, `Rendering frame ${i + 1} of ${frames} · ${fmt(t)} / ${fmt(total)} · about ${Math.ceil(eta)}s left`);
+        setExportStatus(0.08 + 0.9 * i / frames, `Rendering frame ${i + 1} of ${frames} · ${fmt(t)} / ${fmt(total)} · about ${Math.ceil(eta)}s left`);
       }
     }
     await venc.flush(); venc.close(); venc = null;
-    if (acodec && audioBuf) {
-      setExportStatus(0.92, 'Encoding audio…');
-      aenc = new AudioEncoder({ output: (c, m) => muxer.addAudioChunk(c, m), error: (e) => { err = e; } });
-      aenc.configure(acodec.cfg);
-      await encodeAudio(audioBuf, aenc);
-      aenc.close(); aenc = null;
-      if (err) throw err;
-    } else if (acodec) {
-      // No audio at all (silent clips, no music): still finalize a valid file by muxing nothing.
-    }
     if (offline.cancelled) throw new Error('cancelled');
-    setExportStatus(0.98, 'Writing file…');
+    setExportStatus(0.99, 'Writing file…');
     muxer.finalize();
     const blob = new Blob([target.buffer], { type: 'video/mp4' });
-    showExportResult(blob, 'mp4', `${vcodec.mux === 'avc' ? 'H.264' : vcodec.mux.toUpperCase()}${acodec ? ' + ' + acodec.mux.toUpperCase() : ''}`);
+    const vLabel = vcodec.mux === 'avc' ? 'H.264' : vcodec.mux.toUpperCase();
+    const aLabel = audioTrack ? `${audioTrack.label} audio (${mix.notes.join(', ')})` : `no audio (${mix.notes.join(', ')})`;
+    showExportResult(blob, 'mp4', `${vLabel} · ${aLabel}`);
   } catch (e) {
     try { if (venc && venc.state !== 'closed') venc.close(); } catch (x) {}
     try { if (aenc && aenc.state !== 'closed') aenc.close(); } catch (x) {}
@@ -1697,7 +1856,14 @@ function closeExport() {
 }
 // Export frames are drawn by requestAnimationFrame, which browsers pause for hidden tabs.
 document.addEventListener('visibilitychange', () => { if (document.hidden && state.exporting) { cancelExport(); toast('Export stopped because the app went to the background. Keep it open while rendering.', 5000); } });
+function unlockScratch() {
+  let firstVideo = null; state.media.forEach(m => { if (!firstVideo && m.kind === 'video') firstVideo = m; });
+  if (!firstVideo) return;
+  if (!scratch.mediaId) bindSync(scratch, firstVideo);
+  try { const p = scratch.el.play(); if (p && p.then) p.then(() => scratch.el.pause()).catch(() => {}); } catch (e) {}
+}
 async function startExport() {
+  unlockScratch();
   const res = $('#exportRes').value === '1080' ? 1920 : 1280;
   const fps = Number($('#exportFps').value) || 30;
   if (state.exportingOffline || state.exporting) return;
@@ -2360,5 +2526,5 @@ window.addEventListener('error', (e) => { if (e && e.message) toast(`Error: ${e.
 window.addEventListener('unhandledrejection', (e) => { const r = e && e.reason; toast(`Error: ${r && r.message ? r.message : r}`, 6000); });
 
 /* Exposed for debugging / tests */
-window.QuikWeb = { HAS_WEBCODECS, startOfflineExport, players, scratch, planEdit, fitToLength, targetSeconds, state, importFiles, addToTimeline, autoCreate, applyTheme, beatSync, play, pause, setPlayhead, renderAt, totalDuration, layout, setMusic, splitAtPlayhead, startExport, pickMime, useLibraryTrack, loadLibrary };
+window.QuikWeb = { HAS_WEBCODECS, startOfflineExport, audioFallback, audioBufferCache, players, scratch, planEdit, fitToLength, targetSeconds, state, importFiles, addToTimeline, autoCreate, applyTheme, beatSync, play, pause, setPlayhead, renderAt, totalDuration, layout, setMusic, splitAtPlayhead, startExport, pickMime, useLibraryTrack, loadLibrary };
 })();

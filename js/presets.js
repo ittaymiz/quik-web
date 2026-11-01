@@ -26,4 +26,6 @@ const THEMES = {
 };
 
 /* Target seconds per clip for each pace. */
-const PACE = { slow: 4.5, medium: 2.8, fast: 1.5 };
+const PACE = { slow: 6, medium: 4, fast: 2.5 };
+/* Auto edits never cut a clip shorter than this (unless the footage itself is shorter). */
+const AUTO_MIN_CLIP = 2.5;
