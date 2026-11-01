@@ -1104,20 +1104,34 @@ function targetSeconds() {
   return clamp(Number(t) || 120, 5, 3600);
 }
 function fmtLen(sec) { const m = Math.floor(sec / 60), r = Math.round(sec % 60); return m ? `${m}:${String(r).padStart(2, '0')}` : `${r}s`; }
-/* Builds a fresh clip list from everything in the media bin so that the whole video lasts ~target seconds:
-   segments are spread evenly across each video, photos are interleaved. */
+/* Picks n items spread evenly across a list (keeps order). */
+function pickEvenly(arr, n) {
+  if (n >= arr.length) return arr.slice();
+  if (n <= 0) return [];
+  const out = [];
+  for (let i = 0; i < n; i++) out.push(arr[Math.min(arr.length - 1, Math.floor((i + 0.5) * arr.length / n))]);
+  return out;
+}
+/* Builds a fresh clip list from the media bin so that the whole video lasts ~target seconds.
+   The number of clips is capped by the target and the minimum clip length; files are chosen
+   evenly across the bin, segments are spread evenly inside each video, photos are interleaved. */
 function planEdit(target) {
   const pace = PACE[P().pace] || PACE.medium;
-  const videos = [], images = [];
+  let videos = [], images = [];
   state.media.forEach(m => (m.kind === 'video' ? videos : images).push(m));
   if (!videos.length && !images.length) return [];
+  const maxClips = Math.max(1, Math.floor(target / AUTO_MIN_CLIP));
+  // Photos take at most a third of the slots (all of them when there is no video).
+  const imgSlots = videos.length ? Math.min(images.length, Math.floor(maxClips / 3)) : Math.min(images.length, maxClips);
+  images = pickEvenly(images, imgSlots);
   let imgDur = clamp(pace, 2, 4);
-  if (images.length * imgDur > target * 0.4 && images.length) imgDur = Math.max(1.5, target * 0.4 / images.length);
-  const imgTotal = images.length * imgDur;
-  const videoBudget = Math.max(0, target - imgTotal);
+  if (images.length && images.length * imgDur > target * 0.4) imgDur = Math.max(2, target * 0.4 / images.length);
+  const videoBudget = Math.max(0, target - images.length * imgDur);
+  const videoSlots = Math.max(0, maxClips - images.length);
+  if (videos.length > videoSlots) videos = pickEvenly(videos, videoSlots);
   const totalSrc = videos.reduce((a, m) => a + m.duration, 0);
   const videoClips = [];
-  if (videos.length) {
+  if (videos.length && videoSlots > 0) {
     if (totalSrc <= videoBudget * 1.02) {
       // Less footage than the target: use everything, cut into pace-sized pieces for rhythm.
       videos.forEach(m => {
@@ -1126,9 +1140,20 @@ function planEdit(target) {
         for (let j = 0; j < k; j++) { const c = defaultClip(m); c.start = j * seg; c.end = Math.min(m.duration, (j + 1) * seg); videoClips.push(c); }
       });
     } else {
-      videos.forEach(m => {
-        const share = videoBudget * m.duration / totalSrc;
-        const k = Math.max(1, Math.round(share / pace));
+      // One segment per file first, then hand out the remaining slots to the longest files.
+      const ks = videos.map(() => 1);
+      let extra = videoSlots - videos.length;
+      const want = videos.map(m => Math.max(1, Math.round(videoBudget * m.duration / totalSrc / pace)));
+      while (extra > 0) {
+        let best = -1, bestGap = 0;
+        videos.forEach((m, i) => { const gap = (want[i] - ks[i]) * m.duration; if (gap > bestGap && ks[i] < Math.floor(m.duration / AUTO_MIN_CLIP)) { bestGap = gap; best = i; } });
+        if (best < 0) break;
+        ks[best]++; extra--;
+      }
+      const totalK = ks.reduce((a, b) => a + b, 0);
+      videos.forEach((m, i) => {
+        const k = ks[i];
+        const share = videoBudget * k / totalK;
         const segLen = clamp(share / k, Math.min(AUTO_MIN_CLIP, m.duration), m.duration);
         const margin = Math.min(m.duration * 0.05, 1);
         const usable = Math.max(segLen, m.duration - 2 * margin);
