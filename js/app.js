@@ -1498,7 +1498,7 @@ async function decodeViaMediabunny(blob) {
     input = new mb.Input({ source: new mb.BlobSource(blob), formats: mb.ALL_FORMATS });
     const track = await input.getPrimaryAudioTrack();
     if (!track) return { none: true };
-    if (!(await track.canDecode())) return null;
+    if (!(await track.canDecode())) { exportDiag.push(`mediabunny: ${track.codec || 'unknown'} track cannot be decoded here (AudioDecoder ${typeof AudioDecoder !== 'undefined' ? 'present' : 'missing'})`); return null; }
     const sink = new mb.AudioBufferSink(track);
     const parts = []; let end = 0, sr = 48000, ch = 2;
     for await (const w of sink.buffers()) { parts.push(w); end = Math.max(end, w.timestamp + w.duration); sr = w.buffer.sampleRate; ch = w.buffer.numberOfChannels; }
@@ -1510,7 +1510,7 @@ async function decodeViaMediabunny(blob) {
       for (let c = 0; c < ch; c++) out.getChannelData(c).set(w.buffer.getChannelData(Math.min(c, w.buffer.numberOfChannels - 1)).subarray(0, Math.max(0, out.length - off)), off);
     }
     return { buffer: out };
-  } catch (e) { console.info('mediabunny decode failed', e && e.message); return null; }
+  } catch (e) { exportDiag.push(`mediabunny decode failed: ${e && e.message}`); return null; }
   finally { try { input && input.dispose && input.dispose(); } catch (e) {} }
 }
 async function getAudioBuffer(key, blob) {
@@ -1654,6 +1654,36 @@ async function renderAudioOffline(total, onStatus, sr = 48000) {
   notes.push(`mix peak ${peak.toFixed(3)}`);
   if (peak < 1e-4) exportDiag.push('the audio mix is silent');
   return { buffer: rendered, notes };
+}
+/* AudioSpecificConfig for AAC-LC (what an MP4 esds box must carry). */
+function aacLcConfig(sampleRate, channels) {
+  const rates = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350];
+  const idx = Math.max(0, rates.indexOf(sampleRate));
+  const bits = (2 << 11) | (idx << 7) | (channels << 3);   // objectType(5) | freqIndex(4) | channelConfig(4) | 000
+  return new Uint8Array([bits >> 8, bits & 0xff]);
+}
+/* Some encoders (Safari's) hand back a full ESDS "magic cookie" instead of the bare AudioSpecificConfig.
+   Returns a valid 2-byte AAC-LC config for the muxer, extracting it from the cookie when possible. */
+function normalizeAacDescription(desc, sampleRate, channels) {
+  const want = aacLcConfig(sampleRate, channels);
+  if (!desc) { exportDiag.push('AAC config missing; synthesized'); return want; }
+  const u8 = ArrayBuffer.isView(desc) ? new Uint8Array(desc.buffer, desc.byteOffset, desc.byteLength) : new Uint8Array(desc);
+  const looksLikeAsc = (b) => b.length >= 2 && b.length <= 5 && [1, 2, 3, 4].includes(b[0] >> 3) && ((b[0] & 7) << 1 | (b[1] >> 7)) <= 12;
+  if (looksLikeAsc(u8)) {
+    if (u8[0] !== want[0] || (u8[1] & 0xf8) !== (want[1] & 0xf8)) exportDiag.push(`AAC config from encoder (${Array.from(u8).map(x => x.toString(16).padStart(2, '0')).join(' ')}) differs from the mix (${sampleRate} Hz, ${channels} ch); using the mix values`);
+    return want;
+  }
+  // Walk MPEG-4 descriptors looking for DecoderSpecificInfo (tag 5).
+  for (let i = 0; i < u8.length - 2; i++) {
+    if (u8[i] === 0x05) {
+      let j = i + 1, size = 0, k = 0;
+      while (j < u8.length && k < 4) { const b = u8[j++]; size = (size << 7) | (b & 0x7f); k++; if (!(b & 0x80)) break; }
+      const cand = u8.subarray(j, j + size);
+      if (looksLikeAsc(cand)) { exportDiag.push(`AAC config extracted from encoder cookie (${Array.from(cand).map(x => x.toString(16).padStart(2, '0')).join(' ')}); muxing with mix values (${sampleRate} Hz)`); return want; }
+    }
+  }
+  exportDiag.push(`AAC config from encoder not understood (${u8.length} bytes); synthesized`);
+  return want;
 }
 /* Encodes the mix without WebCodecs: records it with MediaRecorder in real time, then pulls the
    compressed packets back out with mediabunny so they can be muxed next to the video. */
@@ -1810,6 +1840,10 @@ const exportDiag = [];
 exportDiag.push = function (msg) { if (this.length < 12) Array.prototype.push.call(this, msg); console.info('[export]', msg); };
 const QUALITY = { share: { res: 1280, fps: 30, bitrate: 4e6, label: '720p' }, high: { res: 1920, fps: 30, bitrate: 10e6, label: '1080p' }, max: { res: 1920, fps: 60, bitrate: 14e6, label: '1080p60' } };
 
+function recorderTrack(r) {
+  return { codec: r.codec, sampleRate: r.sampleRate, channels: r.channels, label: r.codec.toUpperCase() + ' (recorder)', source: 'recorder',
+    add: (mx) => r.packets.forEach((pk, i) => mx.addAudioChunkRaw(pk.data, pk.type, Math.round(pk.timestamp * 1e6), Math.round(pk.duration * 1e6), i === 0 ? { decoderConfig: r.decoderConfig } : undefined)) };
+}
 /* @returns true when the file was produced (or cancelled), false to fall back to MediaRecorder. */
 async function startOfflineExport(q) {
   if (!HAS_WEBCODECS) return false;
@@ -1843,14 +1877,22 @@ async function startOfflineExport(q) {
         await encodeAudio(mix.buffer, aenc);
         aenc.close(); aenc = null;
         audioStatus = 'Audio ready';
-        return { mix, track: { codec: acodec.mux, sampleRate: 48000, channels: 2, label: acodec.mux.toUpperCase(), add: (mx) => chunks.forEach(([c, m]) => mx.addAudioChunk(c, m)) } };
+        const sr = 48000, ch = 2;
+        const add = (mx) => chunks.forEach(([c, m], i) => {
+          let meta = m;
+          if (acodec.mux === 'aac') {
+            const desc = m && m.decoderConfig ? m.decoderConfig.description : null;
+            meta = i === 0 ? { decoderConfig: { codec: 'mp4a.40.2', sampleRate: sr, numberOfChannels: ch, description: normalizeAacDescription(desc, sr, ch) } } : undefined;
+          }
+          mx.addAudioChunk(c, meta);
+        });
+        return { mix, track: { codec: acodec.mux, sampleRate: sr, channels: ch, label: acodec.mux.toUpperCase(), source: 'encoder', add } };
       }
       exportDiag.push('AudioEncoder unavailable; using the recorder');
       const r = await encodeMixWithRecorder(mix.buffer, (txt) => { audioStatus = txt; });
       if (r && r.packets.length) {
         audioStatus = 'Audio ready';
-        return { mix, track: { codec: r.codec, sampleRate: r.sampleRate, channels: r.channels, label: r.codec.toUpperCase() + ' (recorder)',
-          add: (mx) => r.packets.forEach((pk, i) => mx.addAudioChunkRaw(pk.data, pk.type, Math.round(pk.timestamp * 1e6), Math.round(pk.duration * 1e6), i === 0 ? { decoderConfig: r.decoderConfig } : undefined)) } };
+        return { mix, track: recorderTrack(r) };
       }
       mix.notes.push('audio could not be encoded in this browser');
       audioStatus = 'no audio (encoder unavailable)';
@@ -1881,21 +1923,37 @@ async function startOfflineExport(q) {
     await venc.flush(); venc.close(); venc = null;
     videoStatus = 'Video ready';
     show(0.94);
-    const { mix, track: audioTrack } = await audioPromise;
+    const { mix } = await audioPromise;
+    let audioTrack = (await audioPromise).track;
     if (offline.cancelled) throw new Error('cancelled');
-    // ---- Mux
-    setExportStatus(0.98, 'Writing file…');
-    const target = new Mp4Muxer.ArrayBufferTarget();
-    const muxer = new Mp4Muxer.Muxer({
-      target,
-      video: { codec: vcodec.mux, width: W, height: H, frameRate: fps },
-      audio: audioTrack ? { codec: audioTrack.codec, sampleRate: audioTrack.sampleRate, numberOfChannels: audioTrack.channels } : undefined,
-      fastStart: 'in-memory', firstTimestampBehavior: 'offset'
-    });
-    vchunks.forEach(([c, m]) => muxer.addVideoChunk(c, m));
-    if (audioTrack) audioTrack.add(muxer);
-    muxer.finalize();
-    const blob = new Blob([target.buffer], { type: 'video/mp4' });
+    // ---- Mux, then verify the audio really decodes; if not, re-encode with the recorder and mux again.
+    const mux = (track) => {
+      const target = new Mp4Muxer.ArrayBufferTarget();
+      const muxer = new Mp4Muxer.Muxer({
+        target,
+        video: { codec: vcodec.mux, width: W, height: H, frameRate: fps },
+        audio: track ? { codec: track.codec, sampleRate: track.sampleRate, numberOfChannels: track.channels } : undefined,
+        fastStart: 'in-memory', firstTimestampBehavior: 'offset'
+      });
+      vchunks.forEach(([c, m]) => muxer.addVideoChunk(c, m));
+      if (track) track.add(muxer);
+      muxer.finalize();
+      return new Blob([target.buffer], { type: 'video/mp4' });
+    };
+    setExportStatus(0.97, 'Writing file…');
+    let blob = mux(audioTrack);
+    if (audioTrack && audioTrack.source === 'encoder' && mix.buffer) {
+      setExportStatus(0.98, 'Checking audio…');
+      const check = await verifyExportAudio(blob);
+      exportDiag.push(`first audio check: ${check.text}`);
+      if (check.ok === false || (check.ok === null && /cannot decode/.test(check.text))) {
+        audioStatus = 'Re-encoding audio with the recorder…';
+        show(0.98);
+        const r = await encodeMixWithRecorder(mix.buffer, (txt) => { audioStatus = txt; show(0.98); });
+        if (offline.cancelled) throw new Error('cancelled');
+        if (r && r.packets.length) { audioTrack = recorderTrack(r); blob = mux(audioTrack); exportDiag.push('audio re-encoded with the recorder'); }
+      }
+    }
     const secs = ((performance.now() - t0) / 1000).toFixed(0);
     const vLabel = `${vcodec.mux === 'avc' ? 'H.264' : vcodec.mux.toUpperCase()} ${QUALITY[q] ? QUALITY[q].label : ''}`;
     const aLabel = audioTrack ? `${audioTrack.label} audio (${(mix.notes || []).join(', ')})` : `no audio (${(mix.notes || []).join(', ')})`;
@@ -2711,5 +2769,5 @@ window.addEventListener('error', (e) => { if (e && e.message) toast(`Error: ${e.
 window.addEventListener('unhandledrejection', (e) => { const r = e && e.reason; toast(`Error: ${r && r.message ? r.message : r}`, 6000); });
 
 /* Exposed for debugging / tests */
-window.QuikWeb = { HAS_WEBCODECS, startOfflineExport, audioFallback, audioBufferCache, players, scratch, planEdit, fitToLength, targetSeconds, state, importFiles, addToTimeline, autoCreate, applyTheme, beatSync, play, pause, setPlayhead, renderAt, totalDuration, layout, setMusic, splitAtPlayhead, startExport, pickMime, useLibraryTrack, loadLibrary };
+window.QuikWeb = { HAS_WEBCODECS, startOfflineExport, audioFallback, audioBufferCache, normalizeAacDescription, aacLcConfig, players, scratch, planEdit, fitToLength, targetSeconds, state, importFiles, addToTimeline, autoCreate, applyTheme, beatSync, play, pause, setPlayhead, renderAt, totalDuration, layout, setMusic, splitAtPlayhead, startExport, pickMime, useLibraryTrack, loadLibrary };
 })();
