@@ -1531,8 +1531,23 @@ async function getAudioBuffer(key, blob) {
 }
 const audioNoTrack = new Set();
 let capSrc = null;
-/* Plays [start,end] of a clip's file silently through the audio graph and records the PCM. */
+function bufferPeak(buf) {
+  let peak = 0;
+  for (let c = 0; c < buf.numberOfChannels; c++) { const d = buf.getChannelData(c); for (let i = 0; i < d.length; i += 7) { const v = Math.abs(d[i]); if (v > peak) peak = v; } }
+  return peak;
+}
+/* Plays [start,end] of a clip's file silently through the audio graph and records the PCM.
+   Captures at 2x first; if that comes back silent (some players mute fast rates) it retries at 1x. */
 async function captureElementAudio(m, start, end, speed, onProgress) {
+  const fast = await captureElementAudioAt(m, start, end, speed, 2, onProgress);
+  if (fast && bufferPeak(fast) > 1e-4) return { buffer: fast, rate: 2 };
+  exportDiag.push(`2x capture of ${m.name} was silent; retrying at 1x`);
+  const slow = await captureElementAudioAt(m, start, end, speed, 1, onProgress);
+  if (slow && bufferPeak(slow) > 1e-4) return { buffer: slow, rate: 1 };
+  if (slow) exportDiag.push(`capture of ${m.name} is silent (play allowed: ${!scratch.el.paused || scratch.el.currentTime > start + 0.1}, ctx: ${actx ? actx.state : 'none'})`);
+  return slow ? { buffer: slow, rate: 1 } : null;
+}
+async function captureElementAudioAt(m, start, end, speed, CAP_RATE, onProgress) {
   ensureAudio();
   if (!actx || typeof actx.createScriptProcessor !== 'function') return null;
   await bind(scratch, m);
@@ -1548,10 +1563,9 @@ async function captureElementAudio(m, start, end, speed, onProgress) {
     L.push(new Float32Array(ib.getChannelData(0)));
     R.push(new Float32Array(ib.getChannelData(Math.min(1, ib.numberOfChannels - 1))));
   };
-  const CAP_RATE = 2;   // capture twice as fast with pitch correction off; the mix plays it back at half rate
   const expected = Math.max(0.05, (end - start) / Math.max(0.0625, speed * CAP_RATE));
   el.muted = false;
-  try { el.preservesPitch = false; } catch (e) {}
+  try { el.preservesPitch = CAP_RATE === 1; } catch (e) {}
   el.playbackRate = clamp(speed * CAP_RATE, 0.0625, 16);
   await seekTo(el, start);
   await new Promise((res) => {
@@ -1594,7 +1608,7 @@ async function renderAudioOffline(total, onStatus, sr = 48000) {
     if (onStatus) onStatus(`Preparing audio ${i + 1}/${items.length}…`);
     const d = clipDuration(clip), v = effectiveClipVolume(clip);
     let buf = await getAudioBuffer(m.id, m.blob);
-    let src;
+    let src, capRate = 1;
     if (buf) {
       src = octx.createBufferSource(); src.buffer = buf; src.playbackRate.value = clip.speed;
       decoded++;
@@ -1602,7 +1616,8 @@ async function renderAudioOffline(total, onStatus, sr = 48000) {
       // Could not decode the file: capture this segment live (takes as long as the segment).
       const cap = await captureElementAudio(m, clip.start, clip.end, clip.speed, (p) => onStatus && onStatus(`Capturing audio ${i + 1}/${items.length} · ${Math.round(p * 100)}%`));
       if (!cap) continue;
-      src = octx.createBufferSource(); src.buffer = cap; src.playbackRate.value = 0.5;   // undo the 2x capture
+      src = octx.createBufferSource(); src.buffer = cap.buffer; src.playbackRate.value = 1 / cap.rate;   // undo the fast capture
+      capRate = cap.rate;
       captured++;
     } else continue;
     const g = octx.createGain();
@@ -1611,7 +1626,7 @@ async function renderAudioOffline(total, onStatus, sr = 48000) {
     g.gain.setValueAtTime(v, offset + d - edge); g.gain.linearRampToValueAtTime(0, offset + d);
     src.connect(g).connect(octx.destination);
     if (buf) src.start(offset, Math.min(clip.start, Math.max(0, buf.duration - 0.01)), Math.max(0.01, clip.end - clip.start));
-    else src.start(offset, 0, d / 2);
+    else src.start(offset, 0, d / capRate);
     any = true;
   }
   const mus = P().music;
@@ -1634,7 +1649,11 @@ async function renderAudioOffline(total, onStatus, sr = 48000) {
   if (captured) notes.push(`${captured} clip${captured > 1 ? 's' : ''} captured live`);
   if (!any) return { buffer: null, notes: notes.length ? notes : ['no audio in the clips'] };
   if (onStatus) onStatus('Mixing audio…');
-  return { buffer: await octx.startRendering(), notes };
+  const rendered = await octx.startRendering();
+  const peak = bufferPeak(rendered);
+  notes.push(`mix peak ${peak.toFixed(3)}`);
+  if (peak < 1e-4) exportDiag.push('the audio mix is silent');
+  return { buffer: rendered, notes };
 }
 /* Encodes the mix without WebCodecs: records it with MediaRecorder in real time, then pulls the
    compressed packets back out with mediabunny so they can be muxed next to the video. */
@@ -1904,7 +1923,46 @@ function finishOffline() {
   $('#exportStartBtn').disabled = false;
   setPlayhead(state.playhead);
 }
+/* Opens the finished file and checks that it carries an audible audio track. */
+async function verifyExportAudio(blob) {
+  const mb = MB();
+  if (!mb) return { ok: null, text: 'Audio check unavailable (mediabunny not loaded)' };
+  let input = null;
+  try {
+    input = new mb.Input({ source: new mb.BlobSource(blob), formats: mb.ALL_FORMATS });
+    const track = await input.getPrimaryAudioTrack();
+    if (!track) return { ok: false, text: 'No audio track in the file' };
+    const dur = await input.computeDuration([track]).catch(() => 0);
+    const base = `${(track.codec || '?').toUpperCase()} audio track, ${track.numberOfChannels}ch ${track.sampleRate} Hz, ${fmt(dur)}`;
+    if (!(await track.canDecode())) return { ok: null, text: `${base}. This browser cannot decode it for checking.` };
+    const sink = new mb.AudioBufferSink(track);
+    let peak = 0, n = 0;
+    for await (const w of sink.buffers(0, Math.min(dur || 6, 6))) { peak = Math.max(peak, bufferPeak(w.buffer)); if (++n > 400) break; }
+    return peak > 1e-4 ? { ok: true, text: `${base}. Sound detected ✓` } : { ok: false, text: `${base}, but it is silent ✗` };
+  } catch (e) { return { ok: null, text: `Audio check failed: ${e && e.message}` }; }
+  finally { try { input && input.dispose && input.dispose(); } catch (e) {} }
+}
+function buildReport(extra) {
+  const lines = [
+    `Quik Web ${new Date().toISOString()}`,
+    navigator.userAgent,
+    `WebCodecs: VideoEncoder ${typeof VideoEncoder !== 'undefined'}, AudioEncoder ${typeof AudioEncoder !== 'undefined'}, AudioDecoder ${typeof AudioDecoder !== 'undefined'}, mediabunny ${!!MB()}`,
+    `AudioContext: ${actx ? actx.state + ' @' + actx.sampleRate : 'none'}`,
+    `MediaRecorder audio/mp4: ${window.MediaRecorder && MediaRecorder.isTypeSupported('audio/mp4') ? 'yes' : 'no'}`,
+    `Project: ${P().clips.length} clips, music ${P().music ? P().music.name : 'none'}, musicBlob ${!!state.musicBlob}`,
+    extra || ''
+  ].concat(exportDiag.map(d => '- ' + d));
+  return lines.join('\n');
+}
 function showExportResult(blob, ext, codecLabel) {
+  $('#exportAudioCheck').textContent = 'Checking audio…'; $('#exportAudioCheck').className = 'small-text audio-check';
+  $('#exportReport').textContent = buildReport(`Result: ${codecLabel || ''}`);
+  verifyExportAudio(blob).then(r => {
+    const el = $('#exportAudioCheck');
+    el.textContent = (r.ok === true ? '🔊 ' : r.ok === false ? '🔇 ' : 'ℹ️ ') + r.text;
+    el.className = 'small-text audio-check' + (r.ok === false ? ' bad' : '');
+    $('#exportReport').textContent = buildReport(`Result: ${codecLabel || ''}\nAudio check: ${r.text}`);
+  });
   exportBlob = blob;
   exportName = `${(P().title.trim() || 'quik-video').replace(/[^\w\-]+/g, '_')}.${ext}`;
   $('#exportDialog').hidden = false;
@@ -1984,6 +2042,7 @@ function unlockScratch() {
   try { const p = scratch.el.play(); if (p && p.then) p.then(() => scratch.el.pause()).catch(() => {}); } catch (e) {}
 }
 async function startExport() {
+  ensureAudio();          // must happen inside the tap on iOS, otherwise the audio graph stays suspended
   unlockScratch();
   const q = $('#exportQuality').value || 'share';
   const { res, fps } = QUALITY[q] || QUALITY.share;
@@ -2586,6 +2645,11 @@ function bindUI() {
   $('#exportCancelBtn').addEventListener('click', closeExport);
   $('#exportStartBtn').addEventListener('click', startExport);
   $('#exportShareBtn').addEventListener('click', shareExport);
+  $('#copyReportBtn').addEventListener('click', async () => {
+    const txt = $('#exportReport').textContent;
+    try { await navigator.clipboard.writeText(txt); toast('Report copied'); }
+    catch (e) { const ta = document.createElement('textarea'); ta.value = txt; document.body.appendChild(ta); ta.select(); try { document.execCommand('copy'); toast('Report copied'); } catch (x) { toast('Select the text and copy it manually'); } ta.remove(); }
+  });
   $('#exportDownloadBtn').addEventListener('click', () => { if (exportBlob) downloadBlob(exportBlob, exportName); });
 
   // Keyboard
