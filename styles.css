@@ -216,18 +216,22 @@ button:disabled { opacity: 0.5; cursor: default; filter: none; }
 }
 /* Phones: preview on top, timeline, then a tabbed panel (Media / Clip / Style / Text / Music / Theme). */
 @media (max-width: 760px), (pointer: coarse) and (max-height: 500px) {
-  #app { grid-template-rows: 48px auto 118px 1fr; padding-top: env(safe-area-inset-top); }
-  .topbar { padding: 0 10px; gap: 6px; }
+  #app { grid-template-rows: 56px auto 118px 1fr; padding-top: calc(env(safe-area-inset-top) + 10px); }
+  .topbar { padding: 0 12px; gap: 8px; }
+  .logo-mark { width: 34px; height: 34px; }
   .topbar .sub, .title-input, #newProjectBtn { display: none; }
   .topbar select { width: auto; padding: 6px 4px; font-size: 12px; }
   .workspace { display: contents; }
   .media-panel { display: none; }
   .mobile-only { display: block; }
   .tab.mobile-only { display: block; }
-  .media-page .media-panel { display: flex; border: 0; height: 100%; }
-  .media-page { padding: 0; display: none; }
-  .media-page.active { display: flex; flex-direction: column; }
-  .media-page .media-grid { grid-template-columns: repeat(3, 1fr); }
+  .media-page .media-panel { display: flex; border: 0; height: auto; min-height: 0; }
+  .media-page { padding: 0; display: none; min-height: 0; }
+  .media-page.active { display: flex; flex-direction: column; overflow: auto; -webkit-overflow-scrolling: touch; }
+  .media-page .panel-head { order: 0; }
+  .media-page .panel-foot { order: 1; border-top: 0; border-bottom: 1px solid var(--border); flex-direction: row; }
+  .media-page .drop-zone { order: 2; }
+  .media-page .media-grid { order: 3; flex: none; overflow: visible; grid-template-columns: repeat(3, 1fr); padding-bottom: 24px; }
   .preview-area { grid-row: 2; max-height: 42vh; max-height: 42dvh; min-width: 0; }
   .inspector, .timeline-panel { min-width: 0; }
   .preview-wrap { padding: 8px; }
