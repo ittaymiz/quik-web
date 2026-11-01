@@ -307,6 +307,8 @@
 
       <!-- FX tab -->
       <section class="tab-page" data-page="fx">
+        <label class="check"><input type="checkbox" id="fxSmooth"> <b>Smooth mode</b> – no flashes, pulses or light leaks</label>
+        <div class="small-text muted">Keeps camera moves, transitions and particles, but removes everything that blinks.</div>
         <label class="field-label">Camera motion <span id="fxMotionLabel"></span></label>
         <input type="range" id="fxMotion" min="0" max="1" step="0.05" value="0.6">
         <div class="small-text muted">Slow zooms and pans on every clip. 0 turns it off.</div>
@@ -348,6 +350,20 @@
           <option value="rain">Rain</option>
           <option value="dust">Floating dust</option>
         </select>
+        <label class="check"><input type="checkbox" id="fxParticlesVary" checked> Vary per clip (some clips get particles, some don't, some get a different kind)</label>
+        <div id="clipParticlesRow">
+          <label class="field-label">This clip's particles</label>
+          <select id="clipParticles">
+            <option value="auto">Auto (randomized)</option>
+            <option value="none">None</option>
+            <option value="snow">Snow</option>
+            <option value="bokeh">Bokeh lights</option>
+            <option value="sparkles">Sparkles</option>
+            <option value="confetti">Confetti</option>
+            <option value="rain">Rain</option>
+            <option value="dust">Floating dust</option>
+          </select>
+        </div>
         <label class="field-label">Film grain <span id="fxGrainLabel"></span></label>
         <input type="range" id="fxGrain" min="0" max="1" step="0.05" value="0">
         <div class="field-row">

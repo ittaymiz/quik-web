@@ -21,7 +21,7 @@ const ASPECTS = { '16:9': [16, 9], '9:16': [9, 16], '1:1': [1, 1], '4:5': [4, 5]
 const PREVIEW_LONG = window.matchMedia('(max-width: 760px)').matches ? 960 : 1280;
 const MIN_CLIP = 1.0;
 /* Effects on by default: camera motion, beat pulse, light leaks, a touch of grain. */
-const FX_DEFAULT = { motion: 0.6, pulse: true, letterbox: false, leaks: true, grain: 0.08, particles: 'none', autoSlowmo: true };
+const FX_DEFAULT = { motion: 0.6, pulse: true, pulseAmt: 0.35, letterbox: false, leaks: true, grain: 0.08, particles: 'none', particlesVary: true, smooth: false, autoSlowmo: true };
 const IS_IOS = /iP(hone|ad|od)/.test(navigator.platform) || (navigator.userAgent.includes('Mac') && 'ontouchend' in document);
 const HAS_CTX_FILTER = (() => { try { const c = document.createElement('canvas').getContext('2d'); return typeof c.filter === 'string'; } catch (e) { return false; } })();
 const phoneLayout = window.matchMedia('(max-width: 760px), (pointer: coarse) and (max-height: 500px)');
@@ -533,13 +533,13 @@ function motionFor(c, idx, lt, dur, t) {
     else if (mode === 'panLeft' || mode === 'panRight') { scale *= 1 + 0.08 * amt; shift += (mode === 'panLeft' ? -1 : 1) * 0.035 * amt * (2 * p - 1); }
   }
   // Beat pulse: a gentle push on the beat (every other beat on fast songs), eased in and out
-  if (f.pulse && P().music && P().music.beats && t !== undefined) {
+  if (f.pulse && !f.smooth && P().music && P().music.beats && t !== undefined) {
     const mus = P().music; const span = Math.max(1, mus.duration - (mus.offset || 0));
     const tt = ((t % span) + span) % span + (mus.offset || 0);
     const fast = (mus.bpm || 0) > 118;
     let dt = Infinity;
     for (let i = mus.beats.length - 1; i >= 0; i--) { if (fast && (i % 2)) continue; const d = tt - mus.beats[i]; if (d >= 0) { dt = d; break; } }
-    const amp = 0.05 * clamp(f.pulseAmt === undefined ? 0.5 : f.pulseAmt, 0, 1);
+    const amp = 0.05 * clamp(f.pulseAmt === undefined ? 0.35 : f.pulseAmt, 0, 1);
     if (dt < 0.5) { const env = dt < 0.06 ? dt / 0.06 : Math.exp(-(dt - 0.06) / 0.18); scale *= 1 + amp * env; }
   }
   // Push / whip transitions act on the incoming clip
@@ -561,7 +561,7 @@ function getNoise() {
   noiseTile = c; noiseUrl = c.toDataURL('image/png');
   return c;
 }
-function leakAlpha(lt, clip) { const f = fx(); if (!f.leaks || (clip && clip.leak === false)) return 0; const p = lt / 1.2; return p >= 0 && p < 1 ? 0.5 * Math.sin(Math.PI * p) : 0; }
+function leakAlpha(lt, clip) { const f = fx(); if (!f.leaks || f.smooth || (clip && clip.leak === false)) return 0; const p = lt / 1.2; return p >= 0 && p < 1 ? 0.5 * Math.sin(Math.PI * p) : 0; }
 /* ---------- Particle graphics (stateless: every frame is a function of time, so preview = export) ---------- */
 const PARTICLE_KINDS = {
   snow:     { n: 80,  size: [2, 6],   fall: [35, 80],   drift: 25,  alpha: 0.9 },
@@ -610,8 +610,14 @@ function drawParticles(cx, kind, t, w, h) {
 }
 const stageParticles = $('#stageParticles');
 const stageParticlesCtx = stageParticles.getContext('2d');
-function stageParticlesUpdate(t) {
-  const kind = fx().particles;
+function particlesFor(c) {
+  const f = fx();
+  if (c && c.particles && c.particles !== 'auto') return c.particles;
+  if (f.particlesVary !== false && c && c.particlesAuto) return c.particlesAuto;
+  return f.particles || 'none';
+}
+function stageParticlesUpdate(t, clip) {
+  const kind = particlesFor(clip);
   if (!kind || kind === 'none' || !PARTICLE_KINDS[kind]) { stageParticles.style.display = 'none'; return; }
   const ar = W / H, pw = 640, ph = Math.round(640 / ar);
   if (stageParticles.width !== pw || stageParticles.height !== ph) { stageParticles.width = pw; stageParticles.height = ph; }
@@ -623,7 +629,8 @@ function stageParticlesUpdate(t) {
 /* Canvas overlays: light leak, particles, grain, letterbox. */
 function drawOverlays(loc) {
   const cx = ctxRef.ctx; const f = fx();
-  if (f.particles && f.particles !== 'none' && loc) drawParticles(cx, f.particles, loc.offset + loc.lt, W, H);
+  const pk = loc ? particlesFor(loc.clip) : 'none';
+  if (pk !== 'none') drawParticles(cx, pk, loc.offset + loc.lt, W, H);
   const la = loc ? leakAlpha(loc.lt, loc.clip) : 0;
   if (la > 0) {
     const p = loc.lt / 1.2;
@@ -633,7 +640,7 @@ function drawOverlays(loc) {
   }
   if (f.grain > 0) {
     const n = getNoise();
-    cx.save(); cx.globalCompositeOperation = 'overlay'; cx.globalAlpha = clamp(f.grain, 0, 1) * 0.25;
+    cx.save(); cx.globalCompositeOperation = 'overlay'; cx.globalAlpha = clamp(f.grain, 0, 1) * (f.smooth ? 0.12 : 0.25);
     const k = Math.floor(((loc && (loc.offset + loc.lt)) || 0) * 8);
     const ox = -Math.floor(prand(k, 11) * 128), oy = -Math.floor(prand(k, 12) * 128);
     const sc = Math.max(1, Math.round(W / 960));   // keep grain size similar at any resolution
@@ -655,12 +662,12 @@ function stageOverlays(loc) {
   if (f.grain > 0) {
     if (!noiseUrl) getNoise();
     if (!stageGrain.style.backgroundImage) stageGrain.style.backgroundImage = `url(${noiseUrl})`;
-    stageGrain.style.opacity = String(clamp(f.grain, 0, 1) * 0.25);
+    stageGrain.style.opacity = String(clamp(f.grain, 0, 1) * (f.smooth ? 0.12 : 0.25));
     const k = Math.floor(((loc && (loc.offset + loc.lt)) || 0) * 8);
     stageGrain.style.backgroundPosition = `${Math.floor(prand(k, 11) * 128)}px ${Math.floor(prand(k, 12) * 128)}px`;
   } else stageGrain.style.opacity = '0';
   stageBars.style.display = f.letterbox ? 'block' : 'none';
-  stageParticlesUpdate(loc ? loc.offset + loc.lt : 0);
+  stageParticlesUpdate(loc ? loc.offset + loc.lt : 0, loc && loc.clip);
 }
 
 const TEXT_FONTS = {
@@ -994,8 +1001,9 @@ async function renderClipLastFrame(clip) {
   return out;
 }
 
+function effTransition(c) { const tr = c.transition || { type: 'none', duration: 0.6 }; if (fx().smooth && tr.type === 'flash') return { ...tr, type: 'crossfade' }; return tr; }
 function drawTransition(c, idx, lt) {
-  const tr = c.transition;
+  const tr = effTransition(c);
   if (!tr || tr.type === 'none' || lt >= tr.duration) return;
   const p = clamp(lt / tr.duration, 0, 1);
   const prev = idx > 0 ? snapshotFor(idx - 1) : null;
@@ -1219,7 +1227,7 @@ function stageUpdate(loc) {
       stageTextEl.style.transform = (t.style === 'lower' ? '' : 'translate(-50%, -50%)') + extra;
     }
   }
-  const tr = clip.transition;
+  const tr = effTransition(clip);
   const hasPrev = stagePrev.style.display === 'block';
   if (tr && tr.type !== 'none' && lt < tr.duration) {
     const p = clamp(lt / tr.duration, 0, 1);
@@ -2051,16 +2059,27 @@ function randomizeEffects({ transitions = true } = {}) {
   const pool = th.transitions || [th.transition || 'crossfade'];
   const pace = PACE[P().pace] || PACE.medium;
   const pick = (arr, avoid) => { const opts = arr.filter(x => x !== avoid); return opts[Math.floor(Math.random() * opts.length)] || arr[0]; };
-  let prevMove = null, prevTr = null, lastFlash = -10;
+  const f0 = fx();
+  const themeKind = f0.particles && f0.particles !== 'none' ? f0.particles : null;
+  const gentle = ['sparkles', 'dust', 'bokeh'];
+  let prevMove = null, prevTr = null, lastFlash = -10, prevPart = null;
   P().clips.forEach((c, i) => {
     if (c.kind === 'video') {
       c.motion = pick(['zoomIn', 'zoomOut', 'panLeft', 'panRight', 'zoomIn', 'zoomOut'], prevMove);   // zooms a bit more often
       prevMove = c.motion;
       c.motionAmt = 0.6 + Math.random() * 0.7;      // 60%–130% of the FX slider
     }
-    c.leak = Math.random() < 0.6;
+    c.leak = Math.random() < 0.45;
+    // Particles vary per clip: the theme's kind on some clips, a gentle alternative on a few, none on the rest
+    const r = Math.random();
+    let part = 'none';
+    if (themeKind) part = r < 0.45 ? themeKind : r < 0.6 ? pick(gentle.filter(g => g !== themeKind), prevPart) : 'none';
+    else part = r < 0.2 ? pick(gentle, prevPart) : 'none';
+    if (part !== 'none' && part === prevPart && Math.random() < 0.5) part = 'none';
+    c.particlesAuto = part; prevPart = part;
     if (transitions) {
-      let type = i === 0 ? 'fade' : pick(pool, prevTr);
+      const poolEff = f0.smooth ? pool.filter(x => x !== 'flash') : pool;
+      let type = i === 0 ? 'fade' : pick(poolEff.length ? poolEff : ['crossfade'], prevTr);
       if (type === 'flash' && i - lastFlash < 3) type = pick(pool.filter(x => x !== 'flash'), prevTr) || 'crossfade';   // flashes at most every third cut
       if (type === 'flash') lastFlash = i;
       prevTr = type;
@@ -2090,7 +2109,8 @@ function randomizeEffects({ transitions = true } = {}) {
 function applyTheme({ retrim = false } = {}) {
   const th = THEMES[P().theme] || THEMES.classic;
   const pace = PACE[P().pace] || PACE.medium;
-  P().fx = { ...FX_DEFAULT, ...(th.fx || {}) };
+  const keepSmooth = !!(P().fx && P().fx.smooth);
+  P().fx = { ...FX_DEFAULT, ...(th.fx || {}), smooth: keepSmooth };
   P().clips.forEach((c, i) => {
     c.filter = { ...c.filter, preset: th.filter };
     c.transition = { type: i === 0 ? (th.transition === 'crossfade' || th.transition === 'slide' || th.transition === 'wipe' || th.transition === 'zoom' ? 'fade' : th.transition) : th.transition, duration: th.transition === 'flash' ? 0.3 : pace < 2 ? 0.4 : 0.7 };
@@ -3483,7 +3503,9 @@ function renderFxPanel() {
   $('#fxPulse').checked = !!f.pulse; $('#fxLetterbox').checked = !!f.letterbox; $('#fxLeaks').checked = !!f.leaks;
   $('#fxGrain').value = f.grain; $('#fxGrainLabel').textContent = f.grain ? `${Math.round(f.grain * 100)}%` : 'off';
   $('#fxParticles').value = f.particles || 'none';
-  const pa = f.pulseAmt === undefined ? 0.5 : f.pulseAmt; $('#fxPulseAmt').value = pa; $('#fxPulseAmtLabel').textContent = `${Math.round(pa * 100)}%`;
+  $('#fxSmooth').checked = !!f.smooth; $('#fxParticlesVary').checked = f.particlesVary !== false;
+  $('#clipParticlesRow').hidden = !c; if (c) $('#clipParticles').value = c.particles || 'auto';
+  const pa = f.pulseAmt === undefined ? 0.35 : f.pulseAmt; $('#fxPulseAmt').value = pa; $('#fxPulseAmtLabel').textContent = `${Math.round(pa * 100)}%`;
   $('#clipMotionRow').hidden = !(c && c.kind === 'video');
   $('#clipLeakRow').hidden = !c;
   if (c) { $('#clipMotion').value = c.motion || 'auto'; $('#clipLeak').checked = c.leak !== false; }
@@ -3767,6 +3789,9 @@ function bindUI() {
   $('#fxMotion').addEventListener('input', (e) => fxSet({ motion: Number(e.target.value) }));
   $('#fxGrain').addEventListener('input', (e) => fxSet({ grain: Number(e.target.value) }));
   $('#fxParticles').addEventListener('change', (e) => fxSet({ particles: e.target.value }));
+  $('#fxSmooth').addEventListener('change', (e) => { fxSet({ smooth: e.target.checked }); toast(e.target.checked ? 'Smooth mode: no flashes, pulses or leaks' : 'Smooth mode off'); });
+  $('#fxParticlesVary').addEventListener('change', (e) => fxSet({ particlesVary: e.target.checked }));
+  $('#clipParticles').addEventListener('change', (e) => { const c = selectedClip(); if (!c) return; pushUndo(); c.particles = e.target.value; invalidate(c); renderAt(state.playhead); save(); });
   $('#fxPulseAmt').addEventListener('input', (e) => fxSet({ pulseAmt: Number(e.target.value) }));
   $('#fxPulse').addEventListener('change', (e) => fxSet({ pulse: e.target.checked }));
   $('#fxLetterbox').addEventListener('change', (e) => fxSet({ letterbox: e.target.checked }));
@@ -3846,7 +3871,7 @@ async function boot() {
   loadLibrary();
   if (state.media.size) toast('Welcome back – your project was restored');
   if (findDuplicateMedia().length) await removeDuplicateMedia({ silent: true });
-  if (P().clips.length && !P().clips.some(c => c.motionAmt)) { randomizeEffects({ transitions: false }); save(); }
+  if (P().clips.length && (!P().clips.some(c => c.motionAmt) || !P().clips.some(c => c.particlesAuto !== undefined))) { randomizeEffects({ transitions: false }); save(); }
   queueAnalysis(Array.from(state.media.values()));
 }
 boot();
