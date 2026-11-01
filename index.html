@@ -145,6 +145,31 @@
             <button data-speed="8">8×</button>
           </div>
 
+          <label class="field-label">Speed ramp</label>
+          <select id="rampType">
+            <option value="none">None (constant speed)</option>
+            <option value="slowMid">Slow-mo in the middle</option>
+            <option value="slowStart">Slow-mo at the start</option>
+            <option value="slowEnd">Slow-mo at the end</option>
+            <option value="rampUp">Ramp up (slow → fast)</option>
+            <option value="rampDown">Ramp down (fast → slow)</option>
+            <option value="freezeStart">Freeze frame at the start</option>
+            <option value="freezeMid">Freeze frame in the middle</option>
+            <option value="freezeEnd">Freeze frame at the end</option>
+          </select>
+          <div class="field-row" id="rampOptsRow">
+            <select id="rampSlow" title="Slow-motion speed">
+              <option value="0.5">½× slow-mo</option>
+              <option value="0.25">¼× slow-mo</option>
+              <option value="0.125">⅛× slow-mo</option>
+            </select>
+            <select id="rampFreeze" title="Freeze length">
+              <option value="0.5">0.5s freeze</option>
+              <option value="1">1s freeze</option>
+              <option value="2">2s freeze</option>
+              <option value="3">3s freeze</option>
+            </select>
+          </div>
           <label class="field-label">Clip volume <span id="volumeLabel">100%</span></label>
           <input type="range" id="clipVolume" min="0" max="1" step="0.05" value="1">
 
@@ -174,6 +199,13 @@
           <input type="range" id="panX" min="-1" max="1" step="0.02" value="0">
           <label class="field-label">Pan Y</label>
           <input type="range" id="panY" min="-1" max="1" step="0.02" value="0">
+          <label class="field-label">Level horizon <span id="rotateLabel">0°</span></label>
+          <input type="range" id="clipRotate" min="-30" max="30" step="0.5" value="0">
+          <div class="field-row">
+            <button id="rot90Btn" class="small-btn wide">↻ Rotate 90°</button>
+            <button id="flipHBtn" class="small-btn wide">⇆ Flip</button>
+            <button id="flipVBtn" class="small-btn wide">⇅ Flip</button>
+          </div>
 
           <label class="field-label">Order</label>
           <div class="field-row">
@@ -262,8 +294,15 @@
             <option value="zoomOut">Zoom out</option>
             <option value="panLeft">Pan left</option>
             <option value="panRight">Pan right</option>
+            <option value="custom">Custom (keyframes)</option>
           </select>
+          <div class="field-row" id="kfRow" hidden>
+            <button id="kfStartBtn" class="small-btn wide">Set start = current reframe</button>
+            <button id="kfEndBtn" class="small-btn wide">Set end = current reframe</button>
+          </div>
+          <div class="small-text muted" id="kfHint" hidden>Adjust Zoom / Pan in the Clip tab, then set the start and end keyframes. The clip moves from one to the other.</div>
         </div>
+        <label class="check"><input type="checkbox" id="fxAutoSlowmo" checked> Auto slow-mo on the best action moment</label>
         <label class="check" id="clipLeakRow"><input type="checkbox" id="clipLeak"> Light leak at the start of this clip</label>
         <div class="field-row">
           <button id="fxRandomBtn" class="primary-btn wide">🎲 Randomize effects per clip</button>

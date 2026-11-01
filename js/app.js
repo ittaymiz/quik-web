@@ -72,9 +72,56 @@ const P = () => state.project;
 /* ======================================================================
    Timeline model
    ====================================================================== */
+/* ---------- Speed tool: piecewise speed segments (slow-mo, ramps, freeze frames) ---------- */
+function segmentsOf(c) {
+  const sp = c.speed || 1, s = c.start, e = c.end, L = Math.max(0.01, e - s);
+  const seg = (a, b, k) => ({ s0: a, s1: b, sp: sp * k });
+  const r = c.ramp;
+  if (c.kind !== 'video' || !r || !r.type || r.type === 'none') return [seg(s, e, 1)];
+  const slow = r.slow || 0.5, fz = r.freeze || 1;
+  const hold = (t) => ({ s0: t, s1: t, sp: 0, hold: fz });
+  switch (r.type) {
+    case 'slowMid': return [seg(s, s + L / 3, 1), seg(s + L / 3, s + 2 * L / 3, slow), seg(s + 2 * L / 3, e, 1)];
+    case 'slowStart': return [seg(s, s + L / 2, slow), seg(s + L / 2, e, 1)];
+    case 'slowEnd': return [seg(s, s + L / 2, 1), seg(s + L / 2, e, slow)];
+    case 'rampUp': return [seg(s, s + L / 3, slow), seg(s + L / 3, s + 2 * L / 3, 1), seg(s + 2 * L / 3, e, 2)];
+    case 'rampDown': return [seg(s, s + L / 3, 2), seg(s + L / 3, s + 2 * L / 3, 1), seg(s + 2 * L / 3, e, slow)];
+    case 'freezeStart': return [hold(s), seg(s, e, 1)];
+    case 'freezeMid': return [seg(s, s + L / 2, 1), hold(s + L / 2), seg(s + L / 2, e, 1)];
+    case 'freezeEnd': return [seg(s, e, 1), hold(Math.max(s, e - 0.04))];
+  }
+  return [seg(s, e, 1)];
+}
+function segDur(g) { return g.sp === 0 ? (g.hold || 1) : (g.s1 - g.s0) / g.sp; }
+/* Source time of a clip at timeline-local time lt. */
+function srcTimeAt(c, lt) {
+  if (c.kind !== 'video') return 0;
+  const segs = segmentsOf(c); let t = 0;
+  for (let i = 0; i < segs.length; i++) {
+    const g = segs[i], d = segDur(g);
+    if (lt < t + d || i === segs.length - 1) { if (g.sp === 0) return g.s0; return clamp(g.s0 + (lt - t) * g.sp, g.s0, g.s1); }
+    t += d;
+  }
+  return c.end;
+}
+/* Playback speed (0 = frozen) at timeline-local time lt. */
+function speedAt(c, lt) {
+  const segs = segmentsOf(c); let t = 0;
+  for (let i = 0; i < segs.length; i++) { const g = segs[i], d = segDur(g); if (lt < t + d || i === segs.length - 1) return g.sp; t += d; }
+  return c.speed || 1;
+}
+/* Sets c.end so that the clip lasts `dur` seconds on the timeline (ramps included), within maxEnd. */
+function setClipDurationTo(c, dur, maxEnd) {
+  if (c.kind !== 'video') { c.imageDuration = dur; return; }
+  let lo = c.start + 0.05, hi = Math.max(lo, maxEnd);
+  for (let i = 0; i < 20; i++) { const mid = (lo + hi) / 2; c.end = mid; if (clipDuration(c) < dur) lo = mid; else hi = mid; }
+  c.end = clamp(hi, c.start + 0.05, maxEnd);
+}
+
 function clipDuration(c) {
   if (c.kind === 'image') return Math.max(MIN_CLIP, c.imageDuration);
-  return Math.max(MIN_CLIP / 8, (c.end - c.start) / c.speed);
+  if (!c.ramp || !c.ramp.type || c.ramp.type === 'none') return Math.max(MIN_CLIP / 8, (c.end - c.start) / c.speed);
+  return Math.max(MIN_CLIP / 8, segmentsOf(c).reduce((a, g) => a + segDur(g), 0));
 }
 function layout() {
   let t = 0;
@@ -544,11 +591,22 @@ function stageOverlays(loc) {
   stageBars.style.display = f.letterbox ? 'block' : 'none';
 }
 
+/* Reframe values at local time lt (custom keyframes interpolate zoom/pan from start to end). */
+function reframeAt(c, lt, dur) {
+  if (c.motion === 'custom' && c.kf && c.kf.a && c.kf.b) {
+    const p = clamp(lt / Math.max(0.1, dur), 0, 1), e = easeInOut(p), a = c.kf.a, b = c.kf.b;
+    return { zoom: a.zoom + (b.zoom - a.zoom) * e, panX: a.panX + (b.panX - a.panX) * e, panY: a.panY + (b.panY - a.panY) * e };
+  }
+  return { zoom: c.zoom, panX: c.panX, panY: c.panY };
+}
+function levelZoom(c) { const a = ((c.rotate || 0) * Math.PI / 180); return 1 + Math.abs(Math.sin(a)) * (Math.max(W, H) / Math.min(W, H)) * 0.75; }
 function drawSource(c, m, el, lt, dur, extra) {
   const cx = ctxRef.ctx;
-  const sw = m.w, sh = m.h;
+  const odd = ((c.rot90 || 0) % 180) !== 0;
+  const sw = odd ? m.h : m.w, sh = odd ? m.w : m.h;
   let scale = c.fit === 'cover' ? Math.max(W / sw, H / sh) : Math.min(W / sw, H / sh);
-  let z = c.zoom, drift = 0;
+  const rf = reframeAt(c, lt, dur);
+  let z = rf.zoom * levelZoom(c), drift = 0;
   if (c.kind === 'image' && c.kenBurns) {
     const p = clamp(lt / dur, 0, 1);
     z *= 1 + 0.12 * p;
@@ -557,12 +615,17 @@ function drawSource(c, m, el, lt, dur, extra) {
   const mo = motionFor(c, extra ? extra.idx : 0, lt, dur, extra ? extra.t : undefined);
   scale *= z * mo.scale;
   const dw = sw * scale, dh = sh * scale;
-  const dx = (W - dw) / 2 - c.panX * Math.abs(dw - W) / 2 + drift + mo.shift * W;
-  const dy = (H - dh) / 2 - c.panY * Math.abs(dh - H) / 2;
+  const dx = (W - dw) / 2 - rf.panX * Math.abs(dw - W) / 2 + drift + mo.shift * W;
+  const dy = (H - dh) / 2 - rf.panY * Math.abs(dh - H) / 2;
   cx.save();
   const css = filterCss(c.filter);
   if (HAS_CTX_FILTER) cx.filter = css;
-  try { cx.drawImage(el, dx, dy, dw, dh); } catch (e) { /* frame not ready */ }
+  const ang = ((c.rot90 || 0) + (c.rotate || 0)) * Math.PI / 180;
+  if (ang || c.flipH || c.flipV) {
+    cx.translate(dx + dw / 2, dy + dh / 2); cx.rotate(ang); cx.scale(c.flipH ? -1 : 1, c.flipV ? -1 : 1);
+    const bw = odd ? dh : dw, bh = odd ? dw : dh;
+    try { cx.drawImage(el, -bw / 2, -bh / 2, bw, bh); } catch (e) {}
+  } else { try { cx.drawImage(el, dx, dy, dw, dh); } catch (e) { /* frame not ready */ } }
   cx.restore();
   if (!HAS_CTX_FILTER && css !== 'none') applyFilterFallback(css);
   if (c.filter.vignette > 0) {
@@ -767,7 +830,7 @@ async function renderAt(t) {
   const m = state.media.get(loc.clip.mediaId);
   let srcEl = null;
   if (loc.clip.kind === 'video' && m) {
-    const st = loc.clip.start + loc.lt * loc.clip.speed;
+    const st = srcTimeAt(loc.clip, loc.lt);
     const p = playerForIdx(loc.idx);
     await bind(p, m);
     if (token !== renderToken) return;
@@ -811,17 +874,23 @@ function showStage(on) {
 }
 /* Same geometry as drawSource(), expressed in percentages of the stage. */
 function placeStageEl(c, m, lt, dur, el, idx = 0, t) {
-  const sw = m.w, sh = m.h;
+  const odd = ((c.rot90 || 0) % 180) !== 0;
+  const sw = odd ? m.h : m.w, sh = odd ? m.w : m.h;
   let scale = c.fit === 'cover' ? Math.max(W / sw, H / sh) : Math.min(W / sw, H / sh);
-  let z = c.zoom, drift = 0;
+  const rf = reframeAt(c, lt, dur);
+  let z = rf.zoom * levelZoom(c), drift = 0;
   if (c.kind === 'image' && c.kenBurns) { const p = clamp(lt / dur, 0, 1); z *= 1 + 0.12 * p; drift = (p - 0.5) * 0.06 * W; }
   const mo = motionFor(c, idx, lt, dur, t);
   scale *= z * mo.scale;
   const dw = sw * scale, dh = sh * scale;
-  const dx = (W - dw) / 2 - c.panX * Math.abs(dw - W) / 2 + drift + mo.shift * W;
-  const dy = (H - dh) / 2 - c.panY * Math.abs(dh - H) / 2;
-  el.style.left = `${dx / W * 100}%`; el.style.top = `${dy / H * 100}%`;
-  el.style.width = `${dw / W * 100}%`; el.style.height = `${dh / H * 100}%`;
+  const dx = (W - dw) / 2 - rf.panX * Math.abs(dw - W) / 2 + drift + mo.shift * W;
+  const dy = (H - dh) / 2 - rf.panY * Math.abs(dh - H) / 2;
+  const bw = odd ? dh : dw, bh = odd ? dw : dh;            // the element's own box before rotation
+  const cxp = dx + dw / 2, cyp = dy + dh / 2;
+  el.style.left = `${(cxp - bw / 2) / W * 100}%`; el.style.top = `${(cyp - bh / 2) / H * 100}%`;
+  el.style.width = `${bw / W * 100}%`; el.style.height = `${bh / H * 100}%`;
+  const ang = (c.rot90 || 0) + (c.rotate || 0);
+  el.style.transform = (ang || c.flipH || c.flipV) ? `rotate(${ang}deg) scale(${c.flipH ? -1 : 1}, ${c.flipV ? -1 : 1})` : '';
 }
 function stageSetup(loc) {
   const { clip, idx } = loc;
@@ -1000,7 +1069,7 @@ function prerollNext(loc) {
   const p = playerForIdx(loc.idx + 1);   // the other player: free while the current clip plays
   prerolled.add(next.id);
   bindSync(p, nm);
-  try { p.el.playbackRate = clamp(next.speed, 0.0625, 16); p.el.currentTime = next.start; } catch (e) {}
+  try { p.el.playbackRate = clamp(speedAt(next, 0) || next.speed, 0.0625, 16); p.el.currentTime = srcTimeAt(next, 0); } catch (e) {}
 }
 
 function effectiveClipVolume(c) {
@@ -1014,12 +1083,13 @@ function startClipMedia(clip, lt, idx) {
   const p = playerForIdx(idx);
   bindSync(p, m);
   const el = p.el;
-  if (prerolled.has(clip.id) && Math.abs(el.currentTime - (clip.start + lt * clip.speed)) < 0.25) { el.playbackRate = clamp(clip.speed, 0.0625, 16); setElVolume(el, effectiveClipVolume(clip)); el.play().catch(() => {}); return; }
-  el.playbackRate = clamp(clip.speed, 0.0625, 16);
+  const st = srcTimeAt(clip, lt), sp = speedAt(clip, lt);
+  if (prerolled.has(clip.id) && Math.abs(el.currentTime - st) < 0.25 && sp > 0) { el.playbackRate = clamp(sp, 0.0625, 16); setElVolume(el, effectiveClipVolume(clip)); el.play().catch(() => {}); return; }
+  el.playbackRate = clamp(sp || clip.speed, 0.0625, 16);
   try { el.preservesPitch = true; } catch (e) {}
   setElVolume(el, effectiveClipVolume(clip));
-  el.currentTime = clip.start + lt * clip.speed;
-  el.play().catch(() => {});
+  el.currentTime = st;
+  if (sp > 0) el.play().catch(() => {}); else el.pause();
 }
 function stopClipMedia(clip, idx) {
   if (clip.kind === 'video') playerForIdx(idx).el.pause();
@@ -1140,9 +1210,16 @@ function tick() {
   } else if (loc.clip.kind === 'video') {
     const pel = playerForIdx(loc.idx).el;
     if (pel.readyState >= 2) {
-      const expected = loc.clip.start + loc.lt * loc.clip.speed;
-      if (Math.abs(pel.currentTime - expected) > 0.35) pel.currentTime = expected;
-      if (pel.paused) pel.play().catch(() => {});
+      const expected = srcTimeAt(loc.clip, loc.lt), sp = speedAt(loc.clip, loc.lt);
+      if (sp === 0) {   // freeze frame: hold the picture
+        if (!pel.paused) pel.pause();
+        if (Math.abs(pel.currentTime - expected) > 0.05) pel.currentTime = expected;
+      } else {
+        const rate = clamp(sp, 0.0625, 16);
+        if (Math.abs(pel.playbackRate - rate) > 0.001) pel.playbackRate = rate;
+        if (Math.abs(pel.currentTime - expected) > 0.35) pel.currentTime = expected;
+        if (pel.paused) pel.play().catch(() => {});
+      }
     }
   }
   state.playhead = t;
@@ -1207,8 +1284,9 @@ function splitAtPlayhead() {
   b.transition = { type: 'none', duration: 0.6 };
   b.text = { ...b.text, content: '' };
   if (clip.kind === 'video') {
-    const cut = clip.start + lt * clip.speed;
+    const cut = srcTimeAt(clip, lt);
     clip.end = cut; b.start = cut;
+    clip.ramp = null; b.ramp = null;   // ramps are relative to the clip and no longer apply after a split
   } else {
     clip.imageDuration = lt; b.imageDuration = dur - lt;
   }
@@ -1700,9 +1778,11 @@ function fitToLength(target, { silent = false } = {}) {
     const m = state.media.get(c.mediaId);
     if (c.kind === 'image') c.imageDuration = clamp(c.imageDuration * f, 2, 6);
     else if (m) {
-      const maxDur = (maxEndFor(c) - c.start) / c.speed;   // never beyond the clip's own footage
+      const maxEnd = maxEndFor(c);
+      const probe = JSON.parse(JSON.stringify(c)); probe.end = maxEnd;
+      const maxDur = clipDuration(probe);   // never beyond the clip's own footage
       const want = Math.max(Math.min(AUTO_MIN_CLIP, maxDur), clipDuration(c) * f);
-      c.end = c.start + Math.min(want, maxDur) * c.speed;
+      setClipDurationTo(c, Math.min(want, maxDur), maxEnd);
     }
     c.transition.duration = Math.min(c.transition.duration, Math.max(0.2, clipDuration(c) / 2));
   });
@@ -1732,6 +1812,21 @@ function randomizeEffects({ transitions = true } = {}) {
       c.transition = { type, duration: Math.min(base * (0.8 + Math.random() * 0.5), Math.max(0.2, clipDuration(c) / 2)) };
     }
   });
+  // Auto slow-mo: the clip with the strongest action gets a half-speed middle (once per edit)
+  const f = fx();
+  P().clips.forEach(c => { if (c.ramp && c.ramp.auto) c.ramp = null; });
+  if (f.autoSlowmo !== false) {
+    let best = null, bestV = 0.35;
+    P().clips.forEach(c => {
+      if (c.kind !== 'video' || (c.end - c.start) < 3) return;
+      const m = state.media.get(c.mediaId); const sc = m && m.scores;
+      if (!sc || !sc.action) return;
+      let sum = 0, n = 0; for (let i = 0; i < sc.action.length; i++) { const tt = (i + 0.5) * sc.step; if (tt >= c.start && tt <= c.end) { sum += sc.action[i]; n++; } }
+      const v = n ? sum / n : 0;
+      if (v > bestV) { bestV = v; best = c; }
+    });
+    if (best) best.ramp = { type: 'slowMid', slow: 0.5, freeze: 1, auto: true };
+  }
   state.snapCache.clear();
 }
 
@@ -1778,10 +1873,10 @@ async function autoCreate() {
   await ensureAnalyzed();
   P().clips = planEdit(target);
   applyTheme({ retrim: false });
+  randomizeEffects();
   const effTarget = Math.min(target, totalDuration());   // cannot be longer than the footage
   if (P().music && P().music.beats && P().music.beats.length) beatSync({ silent: true, noUndo: true, target: effTarget });
   else fitToLength(effTarget, { silent: true });
-  randomizeEffects();
   state.selectedId = P().clips[0] ? P().clips[0].id : null;
   // Park just after the opening fade so the preview shows a real frame.
   state.playhead = P().clips[0] ? Math.min(P().clips[0].transition.duration, clipDuration(P().clips[0]) / 2) : 0;
@@ -1823,10 +1918,12 @@ function beatSync({ silent = false, noUndo = false, target = null } = {}) {
     let dur = best !== null ? best - t : want;
     if (c.kind === 'image') c.imageDuration = clamp(dur, 2, 6);
     else if (m) {
-      const maxDur = (maxEndFor(c) - c.start) / c.speed;
+      const maxEnd = maxEndFor(c);
+      const probe = JSON.parse(JSON.stringify(c)); probe.end = maxEnd;
+      const maxDur = clipDuration(probe);
       dur = Math.min(dur, maxDur);
       if (dur < minLen) dur = Math.min(maxDur, Math.max(want, minLen));
-      c.end = Math.min(m.duration, c.start + dur * c.speed);
+      setClipDurationTo(c, dur, maxEnd);
     }
     const cd = clipDuration(c);
     c.transition.duration = Math.min(c.transition.duration, Math.max(0.2, cd / 2));
@@ -2144,25 +2241,30 @@ async function renderAudioOffline(total, onStatus, sr = 48000) {
     if (onStatus) onStatus(`Preparing audio ${i + 1}/${items.length}…`);
     const d = clipDuration(clip), v = effectiveClipVolume(clip);
     let buf = await getAudioBuffer(m.id, m.blob);
-    let src, capRate = 1;
-    if (buf) {
-      src = octx.createBufferSource(); src.buffer = buf; src.playbackRate.value = clip.speed;
-      decoded++;
-    } else if (!audioNoTrack.has(m.id)) {
-      // Could not decode the file: capture this segment live (takes as long as the segment).
-      const cap = await captureElementAudio(m, clip.start, clip.end, clip.speed, (p) => onStatus && onStatus(`Capturing audio ${i + 1}/${items.length} · ${Math.round(p * 100)}%`));
-      if (!cap) continue;
-      src = octx.createBufferSource(); src.buffer = cap.buffer; src.playbackRate.value = 1 / cap.rate;   // undo the fast capture
-      capRate = cap.rate;
-      captured++;
-    } else continue;
+    const canCapture = !buf && !audioNoTrack.has(m.id);
+    if (!buf && !canCapture) continue;
     const g = octx.createGain();
     const edge = Math.min(0.03, d / 4);
     g.gain.setValueAtTime(0, offset); g.gain.linearRampToValueAtTime(v, offset + edge);
     g.gain.setValueAtTime(v, offset + d - edge); g.gain.linearRampToValueAtTime(0, offset + d);
-    src.connect(g).connect(octx.destination);
-    if (buf) src.start(offset, Math.min(clip.start, Math.max(0, buf.duration - 0.01)), Math.max(0.01, clip.end - clip.start));
-    else src.start(offset, 0, d / capRate);
+    g.connect(octx.destination);
+    let tOff = offset, played = false;
+    for (const seg of segmentsOf(clip)) {
+      const sd = segDur(seg);
+      if (seg.sp > 0 && sd > 0.01) {
+        const src = octx.createBufferSource();
+        const sg = octx.createGain(); sg.gain.value = seg.sp < 0.6 ? 0.6 : 1;   // slow-mo audio a little quieter
+        if (buf) { src.buffer = buf; src.playbackRate.value = seg.sp; src.connect(sg).connect(g); src.start(tOff, Math.min(seg.s0, Math.max(0, buf.duration - 0.01)), Math.max(0.01, seg.s1 - seg.s0)); }
+        else {
+          const cap = await captureElementAudio(m, seg.s0, seg.s1, seg.sp, (p) => onStatus && onStatus(`Capturing audio ${i + 1}/${items.length} · ${Math.round(p * 100)}%`));
+          if (cap) { src.buffer = cap.buffer; src.playbackRate.value = 1 / cap.rate; src.connect(sg).connect(g); src.start(tOff, 0, cap.buffer.duration); }
+        }
+        played = true;
+      }
+      tOff += sd;
+    }
+    if (!played) continue;
+    if (buf) decoded++; else captured++;
     any = true;
   }
   const mus = P().music;
@@ -2356,7 +2458,7 @@ async function renderFrameOffline(t, cs) {
   const m = state.media.get(loc.clip.mediaId);
   let img = null;
   if (loc.clip.kind === 'video' && m) {
-    const st = loc.clip.start + loc.lt * loc.clip.speed;
+    const st = srcTimeAt(loc.clip, loc.lt);
     const fs = await getFrameSource(m);
     if (fs) { if (cs.fresh) await fs.restart(st); img = await fs.frameAt(st); }
     if (!img) {
@@ -2887,6 +2989,8 @@ function renderTimeline() {
     d.draggable = true; d.dataset.id = clip.id;
     const badges = [];
     if (clip.speed !== 1) badges.push(`${clip.speed}×`);
+    if (clip.ramp && clip.ramp.type && clip.ramp.type !== 'none') badges.push(/freeze/.test(clip.ramp.type) ? '❄' : '🐢');
+    if (clip.rotate || clip.rot90 || clip.flipH || clip.flipV) badges.push('↻');
     if (clip.filter.preset !== 'none') badges.push(FILTERS[clip.filter.preset].name);
     if (clip.text.content.trim()) badges.push('T');
     if (clip.volume === 0 && clip.kind === 'video') badges.push('🔇');
@@ -3026,6 +3130,12 @@ function renderInspector() {
     $('#kenBurns').checked = !!c.kenBurns;
   }
   setSeg('speedSeg', 'speed', c.speed);
+  $('#rampType').value = (c.ramp && c.ramp.type) || 'none';
+  $('#rampSlow').value = String((c.ramp && c.ramp.slow) || 0.5);
+  $('#rampFreeze').value = String((c.ramp && c.ramp.freeze) || 1);
+  $('#rampOptsRow').style.display = c.ramp && c.ramp.type && c.ramp.type !== 'none' ? '' : 'none';
+  $('#rampType').parentElement && ($('#rampType').style.display = isVideo ? '' : 'none');
+  $('#clipRotate').value = c.rotate || 0; $('#rotateLabel').textContent = `${(c.rotate || 0).toFixed(1)}°`;
   $('#clipVolume').value = c.volume; $('#volumeLabel').textContent = `${Math.round(c.volume * 100)}%`;
   $('#transitionType').value = c.transition.type;
   $('#transitionDur').value = c.transition.duration; $('#transitionDurLabel').textContent = `${c.transition.duration.toFixed(1)}s`;
@@ -3102,6 +3212,9 @@ function renderFxPanel() {
   $('#clipMotionRow').hidden = !(c && c.kind === 'video');
   $('#clipLeakRow').hidden = !c;
   if (c) { $('#clipMotion').value = c.motion || 'auto'; $('#clipLeak').checked = c.leak !== false; }
+  const custom = !!(c && c.motion === 'custom');
+  $('#kfRow').hidden = !custom; $('#kfHint').hidden = !custom;
+  $('#fxAutoSlowmo').checked = f.autoSlowmo !== false;
 }
 function renderMusicPanel() {
   const mus = P().music;
@@ -3249,20 +3362,28 @@ function bindUI() {
   $('#setInBtn').addEventListener('click', () => {
     const loc = locate(state.playhead); const c = selectedClip();
     if (!loc || !c || loc.clip.id !== c.id || c.kind !== 'video') { toast('Move the playhead inside the selected clip'); return; }
-    const t = c.start + loc.lt * c.speed;
+    const t = srcTimeAt(c, loc.lt);
     if (c.end - t < MIN_CLIP * c.speed) return;
     pushUndo(); c.start = t; invalidate(c); renderAll(); save();
   });
   $('#setOutBtn').addEventListener('click', () => {
     const loc = locate(state.playhead); const c = selectedClip();
     if (!loc || !c || loc.clip.id !== c.id || c.kind !== 'video') { toast('Move the playhead inside the selected clip'); return; }
-    const t = c.start + loc.lt * c.speed;
+    const t = srcTimeAt(c, loc.lt);
     if (t - c.start < MIN_CLIP * c.speed) return;
     pushUndo(); c.end = t; invalidate(c); renderAll(); save();
   });
   bindRange('#imageDuration', (v, c) => { c.imageDuration = v; $('#imageDurationLabel').textContent = `${v.toFixed(1)}s`; }, { rerenderTimeline: true });
   $('#kenBurns').addEventListener('change', (e) => { const c = selectedClip(); if (!c) return; pushUndo(); c.kenBurns = e.target.checked; invalidate(c); renderAt(state.playhead); save(); });
   bindSeg('speedSeg', 'speed', (v, c) => { c.speed = Number(v); }, { rerenderTimeline: true });
+  const rampOf = (c) => c.ramp || { type: 'none', slow: 0.5, freeze: 1 };
+  bindSelect('#rampType', (v, c) => { c.ramp = v === 'none' ? null : { ...rampOf(c), type: v, auto: false }; }, { rerenderTimeline: true });
+  bindSelect('#rampSlow', (v, c) => { c.ramp = { ...rampOf(c), slow: Number(v), auto: false }; if (c.ramp.type === 'none') c.ramp = null; }, { rerenderTimeline: true });
+  bindSelect('#rampFreeze', (v, c) => { c.ramp = { ...rampOf(c), freeze: Number(v), auto: false }; if (c.ramp.type === 'none') c.ramp = null; }, { rerenderTimeline: true });
+  bindRange('#clipRotate', (v, c) => { c.rotate = v; $('#rotateLabel').textContent = `${v.toFixed(1)}°`; });
+  $('#rot90Btn').addEventListener('click', () => { const c = selectedClip(); if (!c) return; pushUndo(); c.rot90 = ((c.rot90 || 0) + 90) % 360; invalidate(c); renderAt(state.playhead); save(); });
+  $('#flipHBtn').addEventListener('click', () => { const c = selectedClip(); if (!c) return; pushUndo(); c.flipH = !c.flipH; invalidate(c); renderAt(state.playhead); save(); });
+  $('#flipVBtn').addEventListener('click', () => { const c = selectedClip(); if (!c) return; pushUndo(); c.flipV = !c.flipV; invalidate(c); renderAt(state.playhead); save(); });
   bindRange('#clipVolume', (v, c) => { c.volume = v; $('#volumeLabel').textContent = `${Math.round(v * 100)}%`; }, { rerenderTimeline: true });
   bindSelect('#transitionType', (v, c) => { c.transition.type = v; }, { rerenderTimeline: true });
   bindRange('#transitionDur', (v, c) => { c.transition.duration = v; $('#transitionDurLabel').textContent = `${v.toFixed(1)}s`; }, { seekTo: (c) => clipOffset(c.id) + c.transition.duration * 0.5 });
@@ -3355,7 +3476,10 @@ function bindUI() {
   $('#fxPulse').addEventListener('change', (e) => fxSet({ pulse: e.target.checked }));
   $('#fxLetterbox').addEventListener('change', (e) => fxSet({ letterbox: e.target.checked }));
   $('#fxLeaks').addEventListener('change', (e) => fxSet({ leaks: e.target.checked }));
-  $('#clipMotion').addEventListener('change', (e) => { const c = selectedClip(); if (!c) return; pushUndo(); c.motion = e.target.value; invalidate(c); renderAt(state.playhead); save(); });
+  $('#clipMotion').addEventListener('change', (e) => { const c = selectedClip(); if (!c) return; pushUndo(); c.motion = e.target.value; if (c.motion === 'custom' && !c.kf) c.kf = { a: { zoom: c.zoom, panX: c.panX, panY: c.panY }, b: { zoom: Math.min(3, c.zoom * 1.15), panX: c.panX, panY: c.panY } }; invalidate(c); renderFxPanel(); renderAt(state.playhead); save(); });
+  $('#kfStartBtn').addEventListener('click', () => { const c = selectedClip(); if (!c) return; pushUndo(); c.kf = { ...(c.kf || {}), a: { zoom: c.zoom, panX: c.panX, panY: c.panY } }; if (!c.kf.b) c.kf.b = { ...c.kf.a }; c.motion = 'custom'; invalidate(c); save(); toast('Start keyframe set'); });
+  $('#kfEndBtn').addEventListener('click', () => { const c = selectedClip(); if (!c) return; pushUndo(); c.kf = { ...(c.kf || {}), b: { zoom: c.zoom, panX: c.panX, panY: c.panY } }; if (!c.kf.a) c.kf.a = { ...c.kf.b }; c.motion = 'custom'; invalidate(c); save(); toast('End keyframe set'); });
+  $('#fxAutoSlowmo').addEventListener('change', (e) => { P().fx = { ...fx(), autoSlowmo: e.target.checked }; save(); });
   $('#fxRandomBtn').addEventListener('click', () => { if (!P().clips.length) { toast('Add clips first'); return; } pause(); pushUndo(); randomizeEffects(); renderAll(); save(); toast('Every clip got its own effects'); });
   $('#clipLeak').addEventListener('change', (e) => { const c = selectedClip(); if (!c) return; pushUndo(); c.leak = e.target.checked; invalidate(c); renderAt(state.playhead); save(); });
   $('#fxThemeBtn').addEventListener('click', () => { const th = THEMES[P().theme] || THEMES.classic; fxSet({ ...FX_DEFAULT, ...(th.fx || {}) }); toast(`${th.name} look restored`); });
@@ -3436,5 +3560,5 @@ window.addEventListener('error', (e) => { if (e && e.message) toast(`Error: ${e.
 window.addEventListener('unhandledrejection', (e) => { const r = e && e.reason; toast(`Error: ${r && r.message ? r.message : r}`, 6000); });
 
 /* Exposed for debugging / tests */
-window.QuikWeb = { randomizeEffects, ensureFaceApi, peopleScore, faceApiState: () => faceApiState, findDuplicateMedia, removeDuplicateMedia, diagnosticsText, ensureAnalyzed, pickWindows, dedupeClips, uniqueMedia, sceneSimilarity, HAS_WEBCODECS, startOfflineExport, audioFallback, setExportMode: (m) => { exportMode = m; }, audioBufferCache, normalizeAacDescription, aacLcConfig, players, scratch, planEdit, fitToLength, targetSeconds, state, importFiles, addToTimeline, autoCreate, applyTheme, beatSync, play, pause, setPlayhead, renderAt, totalDuration, layout, setMusic, splitAtPlayhead, startExport, pickMime, useLibraryTrack, loadLibrary };
+window.QuikWeb = { segmentsOf, srcTimeAt, speedAt, setClipDurationTo, randomizeEffects, ensureFaceApi, peopleScore, faceApiState: () => faceApiState, findDuplicateMedia, removeDuplicateMedia, diagnosticsText, ensureAnalyzed, pickWindows, dedupeClips, uniqueMedia, sceneSimilarity, HAS_WEBCODECS, startOfflineExport, audioFallback, setExportMode: (m) => { exportMode = m; }, audioBufferCache, normalizeAacDescription, aacLcConfig, players, scratch, planEdit, fitToLength, targetSeconds, state, importFiles, addToTimeline, autoCreate, applyTheme, beatSync, play, pause, setPlayhead, renderAt, totalDuration, layout, setMusic, splitAtPlayhead, startExport, pickMime, useLibraryTrack, loadLibrary };
 })();
