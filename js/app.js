@@ -469,7 +469,7 @@ const MOTIONS = ['zoomIn', 'zoomOut', 'panRight', 'panLeft'];
 function motionFor(c, idx, lt, dur, t) {
   const f = fx();
   let scale = 1, shift = 0;
-  const amt = clamp(f.motion || 0, 0, 1);
+  const amt = clamp((f.motion || 0) * (c.motionAmt || 1), 0, 1.2);
   if (amt > 0 && c.kind === 'video') {
     const mode = !c.motion || c.motion === 'auto' ? MOTIONS[Math.abs(idx) % MOTIONS.length] : c.motion;
     const p = clamp(lt / Math.max(0.1, dur), 0, 1);
@@ -504,11 +504,11 @@ function getNoise() {
   noiseTile = c; noiseUrl = c.toDataURL('image/png');
   return c;
 }
-function leakAlpha(lt) { const f = fx(); if (!f.leaks) return 0; const p = lt / 1.2; return p >= 0 && p < 1 ? 0.5 * Math.sin(Math.PI * p) : 0; }
+function leakAlpha(lt, clip) { const f = fx(); if (!f.leaks || (clip && clip.leak === false)) return 0; const p = lt / 1.2; return p >= 0 && p < 1 ? 0.5 * Math.sin(Math.PI * p) : 0; }
 /* Canvas overlays: light leak, grain, letterbox. */
 function drawOverlays(loc) {
   const cx = ctxRef.ctx; const f = fx();
-  const la = loc ? leakAlpha(loc.lt) : 0;
+  const la = loc ? leakAlpha(loc.lt, loc.clip) : 0;
   if (la > 0) {
     const p = loc.lt / 1.2;
     const g = cx.createRadialGradient(W * (0.15 + 0.8 * p), H * 0.3, 0, W * (0.15 + 0.8 * p), H * 0.3, W * 0.7);
@@ -529,7 +529,7 @@ function drawOverlays(loc) {
 const stageLeak = $('#stageLeak'), stageGrain = $('#stageGrain'), stageBars = $('#stageBars');
 function stageOverlays(loc) {
   const f = fx();
-  const la = loc ? leakAlpha(loc.lt) : 0;
+  const la = loc ? leakAlpha(loc.lt, loc.clip) : 0;
   if (la > 0) {
     const p = loc.lt / 1.2;
     stageLeak.style.background = `radial-gradient(circle at ${(15 + 80 * p).toFixed(1)}% 30%, rgba(255,190,90,1) 0%, rgba(255,120,60,0.5) 35%, rgba(255,80,40,0) 70%)`;
@@ -1710,6 +1710,31 @@ function fitToLength(target, { silent = false } = {}) {
   if (!silent) { renderAll(); save(); toast(`Video is now ${fmt(totalDuration())}`); }
 }
 
+/* Gives every clip its own effects: camera move (never the same as the previous clip), move
+   strength, transition from the theme's pool (never the same twice in a row), light leak yes/no. */
+function randomizeEffects({ transitions = true } = {}) {
+  const th = THEMES[P().theme] || THEMES.classic;
+  const pool = th.transitions || [th.transition || 'crossfade'];
+  const pace = PACE[P().pace] || PACE.medium;
+  const pick = (arr, avoid) => { const opts = arr.filter(x => x !== avoid); return opts[Math.floor(Math.random() * opts.length)] || arr[0]; };
+  let prevMove = null, prevTr = null;
+  P().clips.forEach((c, i) => {
+    if (c.kind === 'video') {
+      c.motion = pick(['zoomIn', 'zoomOut', 'panLeft', 'panRight', 'zoomIn', 'zoomOut'], prevMove);   // zooms a bit more often
+      prevMove = c.motion;
+      c.motionAmt = 0.6 + Math.random() * 0.7;      // 60%–130% of the FX slider
+    }
+    c.leak = Math.random() < 0.6;
+    if (transitions) {
+      const type = i === 0 ? 'fade' : pick(pool, prevTr);
+      prevTr = type;
+      const base = type === 'flash' ? 0.3 : type === 'whip' ? 0.35 : pace < 3 ? 0.45 : 0.7;
+      c.transition = { type, duration: Math.min(base * (0.8 + Math.random() * 0.5), Math.max(0.2, clipDuration(c) / 2)) };
+    }
+  });
+  state.snapCache.clear();
+}
+
 /* ---------- Theme / auto create / beat sync ---------- */
 function applyTheme({ retrim = false } = {}) {
   const th = THEMES[P().theme] || THEMES.classic;
@@ -1756,6 +1781,7 @@ async function autoCreate() {
   const effTarget = Math.min(target, totalDuration());   // cannot be longer than the footage
   if (P().music && P().music.beats && P().music.beats.length) beatSync({ silent: true, noUndo: true, target: effTarget });
   else fitToLength(effTarget, { silent: true });
+  randomizeEffects();
   state.selectedId = P().clips[0] ? P().clips[0].id : null;
   // Park just after the opening fade so the preview shows a real frame.
   state.playhead = P().clips[0] ? Math.min(P().clips[0].transition.duration, clipDuration(P().clips[0]) / 2) : 0;
@@ -3074,7 +3100,8 @@ function renderFxPanel() {
   $('#fxPulse').checked = !!f.pulse; $('#fxLetterbox').checked = !!f.letterbox; $('#fxLeaks').checked = !!f.leaks;
   $('#fxGrain').value = f.grain; $('#fxGrainLabel').textContent = f.grain ? `${Math.round(f.grain * 100)}%` : 'off';
   $('#clipMotionRow').hidden = !(c && c.kind === 'video');
-  if (c) $('#clipMotion').value = c.motion || 'auto';
+  $('#clipLeakRow').hidden = !c;
+  if (c) { $('#clipMotion').value = c.motion || 'auto'; $('#clipLeak').checked = c.leak !== false; }
 }
 function renderMusicPanel() {
   const mus = P().music;
@@ -3318,7 +3345,7 @@ function bindUI() {
   $('#themeTitle').addEventListener('change', (e) => { P().themeTitle = e.target.checked; save(); });
   $('#themeMusic').addEventListener('change', (e) => { P().themeMusic = e.target.checked; save(); });
   [['#prefPeople', 'people'], ['#prefViews', 'views'], ['#prefAction', 'action']].forEach(([sel, key]) => $(sel).addEventListener('change', (e) => { P().prefs = { ...prefs(), [key]: e.target.checked }; save(); }));
-  $('#applyThemeBtn').addEventListener('click', () => { if (!P().clips.length) { toast('Add clips first'); return; } pause(); pushUndo(); applyTheme({ retrim: false }); renderAll(); save(); toast(`${THEMES[P().theme].name} theme applied`); });
+  $('#applyThemeBtn').addEventListener('click', () => { if (!P().clips.length) { toast('Add clips first'); return; } pause(); pushUndo(); applyTheme({ retrim: false }); randomizeEffects(); renderAll(); save(); toast(`${THEMES[P().theme].name} theme applied`); });
   $('#shuffleBtn').addEventListener('click', () => { pause(); shuffleClips(); });
 
   // FX tab
@@ -3329,6 +3356,8 @@ function bindUI() {
   $('#fxLetterbox').addEventListener('change', (e) => fxSet({ letterbox: e.target.checked }));
   $('#fxLeaks').addEventListener('change', (e) => fxSet({ leaks: e.target.checked }));
   $('#clipMotion').addEventListener('change', (e) => { const c = selectedClip(); if (!c) return; pushUndo(); c.motion = e.target.value; invalidate(c); renderAt(state.playhead); save(); });
+  $('#fxRandomBtn').addEventListener('click', () => { if (!P().clips.length) { toast('Add clips first'); return; } pause(); pushUndo(); randomizeEffects(); renderAll(); save(); toast('Every clip got its own effects'); });
+  $('#clipLeak').addEventListener('change', (e) => { const c = selectedClip(); if (!c) return; pushUndo(); c.leak = e.target.checked; invalidate(c); renderAt(state.playhead); save(); });
   $('#fxThemeBtn').addEventListener('click', () => { const th = THEMES[P().theme] || THEMES.classic; fxSet({ ...FX_DEFAULT, ...(th.fx || {}) }); toast(`${th.name} look restored`); });
 
   // Timeline zoom
@@ -3398,6 +3427,7 @@ async function boot() {
   loadLibrary();
   if (state.media.size) toast('Welcome back – your project was restored');
   if (findDuplicateMedia().length) await removeDuplicateMedia({ silent: true });
+  if (P().clips.length && !P().clips.some(c => c.motionAmt)) { randomizeEffects({ transitions: false }); save(); }
   queueAnalysis(Array.from(state.media.values()));
 }
 boot();
@@ -3406,5 +3436,5 @@ window.addEventListener('error', (e) => { if (e && e.message) toast(`Error: ${e.
 window.addEventListener('unhandledrejection', (e) => { const r = e && e.reason; toast(`Error: ${r && r.message ? r.message : r}`, 6000); });
 
 /* Exposed for debugging / tests */
-window.QuikWeb = { ensureFaceApi, peopleScore, faceApiState: () => faceApiState, findDuplicateMedia, removeDuplicateMedia, diagnosticsText, ensureAnalyzed, pickWindows, dedupeClips, uniqueMedia, sceneSimilarity, HAS_WEBCODECS, startOfflineExport, audioFallback, setExportMode: (m) => { exportMode = m; }, audioBufferCache, normalizeAacDescription, aacLcConfig, players, scratch, planEdit, fitToLength, targetSeconds, state, importFiles, addToTimeline, autoCreate, applyTheme, beatSync, play, pause, setPlayhead, renderAt, totalDuration, layout, setMusic, splitAtPlayhead, startExport, pickMime, useLibraryTrack, loadLibrary };
+window.QuikWeb = { randomizeEffects, ensureFaceApi, peopleScore, faceApiState: () => faceApiState, findDuplicateMedia, removeDuplicateMedia, diagnosticsText, ensureAnalyzed, pickWindows, dedupeClips, uniqueMedia, sceneSimilarity, HAS_WEBCODECS, startOfflineExport, audioFallback, setExportMode: (m) => { exportMode = m; }, audioBufferCache, normalizeAacDescription, aacLcConfig, players, scratch, planEdit, fitToLength, targetSeconds, state, importFiles, addToTimeline, autoCreate, applyTheme, beatSync, play, pause, setPlayhead, renderAt, totalDuration, layout, setMusic, splitAtPlayhead, startExport, pickMime, useLibraryTrack, loadLibrary };
 })();
