@@ -37,19 +37,21 @@ On the phone the timeline is scrubbed by dragging on the time ruler; clips are r
 
 | Area | What you can do |
 | --- | --- |
-| Import | Drag & drop or pick videos and photos. Files stay in the browser (IndexedDB) so a reload restores your project. |
-| Auto Create | Plans a whole edit for a chosen length (default 30 seconds): spreads segments across every video, interleaves photos, applies the theme, adds the title and music, and aligns the cuts to the beats. **Re-arrange** rebuilds it for a new length; **Fit** rescales the current clips. |
-| Themes | Classic, Action, Chill, Noir, Retro, Epic, Dreamy, Travel. Each sets a look, a transition style, a pace and a text style. |
-| Trim | Dual-handle trim slider with a filmstrip, or set start/end at the playhead (`[` and `]`). |
-| Split / reorder | Split at the playhead (`S`), drag clips on the timeline to reorder, duplicate, delete. |
-| Speed | ¼×, ½×, 1×, 2×, 4×, 8× (slow motion and time-lapse). |
-| Reframe | Fill or Fit, zoom and pan for 16:9, 9:16, 1:1 and 4:5 output. Photos get Ken Burns motion. |
-| Filters | 12 looks (Vivid, Warm, Cool, B&W, Vintage, Dramatic, …) plus brightness, contrast, saturation and vignette. Apply to one clip or all. |
-| Text | Title per clip with position, style (Bold, Outline, Box, Lower third, Minimal), size, colors, animation and duration. |
-| Transitions | Cut, Crossfade, Fade through black, White flash, Slide, Zoom, Wipe, with adjustable length. |
-| Music | 10 built-in tracks (pop, electronic, lo-fi, synthwave, folk, ambient, hip-hop, house, tropical, cinematic) with preview, or add any audio file. Auto Create adds the theme's track automatically. Volume, start offset, fade in/out, loop, auto-ducking of clip audio. Beat detection with **Sync cuts to beats** and **Fit video length to music**. |
-| Playback | Real-time preview with scrubbing, keyboard shortcuts and timeline zoom. |
-| Export | Renders to WebM (VP9/Opus, or MP4 where the browser supports it) at 720p or 1080p, 30 or 60 fps. Frame grab saves the current frame as PNG. |
+| Import | Drag & drop or pick videos and photos. Files stay in the browser (IndexedDB) so a reload restores your project. Duplicate files are detected and removed. |
+| Auto Create | Plans a whole edit for a chosen length (default 30 seconds). Each video is analysed once for people (on-device face detector), scenic views, action (motion + audio) and quality; the best moments win, several clips may come from one file (always different sections), look-alike files and repeated footage are excluded, and cuts are aligned to the music. **Re-arrange** rebuilds, **Fit** rescales. |
+| HiLight tags | Mark a moment in a clip; Auto Create always keeps a window around it. |
+| Themes | 14 themes (Classic, Action, Chill, Noir, Retro, Epic, Dreamy, Snow, Beach, Sunset, Urban, Party, Rainy day, Travel) with their own look, transition pool, pace, text style, effects and particles. |
+| Speed tool | ¼× to 8× per clip, plus speed ramps: slow-mo at the start / middle / end, ramp up / down, freeze frames (0.5–3 s) at the start / middle / end, with ½×, ¼×, ⅛× slow motion. Auto slow-mo on the strongest action moment. |
+| Trim / split / order | Dual-handle trim with a filmstrip, set start/end at the playhead, split, duplicate, delete, drag or move to reorder. |
+| Reframe | 16:9, 9:16, 1:1, 4:5; Fill/Fit; zoom and pan; level horizon (±30°), rotate 90°, flip; custom keyframed zoom/pan moves. Photos get Ken Burns motion. |
+| Looks | 25 looks including environment filters (Snow, Water, Desert, Beach, Forest, Urban, Sunset, Indoor, Dirt, Cinematic, Teal & Orange, Moody, Bright) plus brightness, contrast, saturation, temperature, tint, fade and vignette. |
+| Effects | Camera motion on every clip (zoom in/out, pan, custom), beat pulse, light leaks, film grain, letterbox bars, particles (snow, bokeh, sparkles, confetti, rain, dust). Effects are randomised per clip so no two clips look alike, and can be tuned in the FX tab. |
+| Transitions | Cut, Crossfade, Fade, White flash, Slide, Zoom, Wipe, Push in, Whip, with adjustable length. |
+| Text | Title per clip with six fonts, five styles, position, size, colours, eight animations and duration. |
+| Stickers | 48 emoji, text stickers, date and time badges; pop/float/spin animations; drag to position in the preview. |
+| Music | 10 built-in tracks with preview, or your own file. Auto Create adds the theme's track. Volume, offset, fades, loop, ducking, beat detection, **Sync cuts to beats**, **Fit video length to music**. |
+| Playback | Smooth native playback on phones (two shared players), scrubbing, keyboard shortcuts, timeline zoom. |
+| Export | Hardware-decoded, frame-accurate MP4 (H.264 + AAC) at Share 720p, High 1080p or Max 1080p60, with an offline audio mix; share straight to Photos / WhatsApp. Frame grab saves a PNG. A built-in check verifies the audio and a technical report explains every step. |
 | Undo / redo | Every edit is undoable (Ctrl+Z / Ctrl+Y). |
 
 ## Keyboard shortcuts
