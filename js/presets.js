@@ -11,7 +11,21 @@ const FILTERS = {
   punch:    { name: 'Punch',    css: 'contrast(1.2) saturate(1.3) brightness(0.98)' },
   pastel:   { name: 'Pastel',   css: 'saturate(0.7) brightness(1.12) contrast(0.9)' },
   night:    { name: 'Night',    css: 'brightness(0.85) contrast(1.2) hue-rotate(-20deg) saturate(0.9)' },
-  golden:   { name: 'Golden',   css: 'sepia(0.45) saturate(1.5) brightness(1.05)' }
+  golden:   { name: 'Golden',   css: 'sepia(0.45) saturate(1.5) brightness(1.05)' },
+  /* Environment looks, in the spirit of GoPro's snow / water / desert filters */
+  snow:     { name: 'Snow',     css: 'brightness(1.08) contrast(1.12) saturate(0.9) hue-rotate(-6deg)' },
+  water:    { name: 'Water',    css: 'hue-rotate(-14deg) saturate(1.35) contrast(1.12) brightness(1.02)' },
+  desert:   { name: 'Desert',   css: 'sepia(0.35) saturate(1.3) contrast(1.08) brightness(1.04)' },
+  beach:    { name: 'Beach',    css: 'saturate(1.3) brightness(1.06) contrast(1.04) hue-rotate(-4deg)' },
+  forest:   { name: 'Forest',   css: 'saturate(1.25) contrast(1.1) hue-rotate(8deg) brightness(0.98)' },
+  urban:    { name: 'Urban',    css: 'contrast(1.25) saturate(0.8) brightness(0.97)' },
+  sunset:   { name: 'Sunset',   css: 'sepia(0.3) saturate(1.6) contrast(1.08) hue-rotate(-8deg)' },
+  indoor:   { name: 'Indoor',   css: 'brightness(1.1) contrast(1.05) saturate(1.05) hue-rotate(6deg)' },
+  dirt:     { name: 'Dirt',     css: 'sepia(0.2) saturate(1.15) contrast(1.15) brightness(0.98)' },
+  cinema:   { name: 'Cinematic', css: 'contrast(1.18) saturate(0.85) sepia(0.12) brightness(0.96)' },
+  tealorange: { name: 'Teal & Orange', css: 'sepia(0.25) saturate(1.5) hue-rotate(-18deg) contrast(1.12)' },
+  moody:    { name: 'Moody',    css: 'contrast(1.2) saturate(0.7) brightness(0.9) hue-rotate(-10deg)' },
+  bright:   { name: 'Bright',   css: 'brightness(1.15) saturate(1.2) contrast(1.02)' }
 };
 
 /* Each theme also carries an `fx` preset: camera motion amount, beat pulse, letterbox, light leaks, grain. */

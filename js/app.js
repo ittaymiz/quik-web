@@ -46,8 +46,9 @@ function defaultClip(m) {
     start: 0, end: m.kind === 'video' ? m.duration : 0,
     speed: 1, volume: 1, imageDuration: 3, kenBurns: true,
     fit: 'cover', zoom: 1, panX: 0, panY: 0,
-    filter: { preset: 'none', brightness: 1, contrast: 1, saturation: 1, vignette: 0 },
-    text: { content: '', pos: 'center', style: 'bold', size: 0.08, color: '#ffffff', accent: '#111111', anim: 'fade', dur: 0 },
+    filter: { preset: 'none', brightness: 1, contrast: 1, saturation: 1, vignette: 0, temperature: 0, tint: 0, fade: 0 },
+    text: { content: '', pos: 'center', style: 'bold', size: 0.08, color: '#ffffff', accent: '#111111', anim: 'fade', dur: 0, font: 'sans' },
+    stickers: [],
     transition: { type: 'none', duration: 0.6 },
     motion: 'auto'
   };
@@ -186,7 +187,7 @@ function save() {
   clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
     DB.putKV('project', JSON.parse(JSON.stringify(P())));
-    DB.putKV('media', Array.from(state.media.values()).map(m => ({ id: m.id, kind: m.kind, name: m.name, scores: m.scores || null })));
+    DB.putKV('media', Array.from(state.media.values()).map(m => ({ id: m.id, kind: m.kind, name: m.name, scores: m.scores || null, date: m.date || null })));
   }, 300);
 }
 
@@ -297,6 +298,7 @@ async function loadVideoMedia(entry) {
     await seekTo(el, 0);
   }
   entry.duration = isFinite(el.duration) ? el.duration : 10;
+  if (!entry.date && entry.blob && entry.blob.lastModified) entry.date = entry.blob.lastModified;
   entry.w = el.videoWidth || 1280; entry.h = el.videoHeight || 720;
   entry.thumb = await grabVideoThumb(el, Math.min(0.5, entry.duration / 2), entry.w, entry.h);
   if (isBlack(entry.thumb)) entry.thumb = await grabVideoThumb(el, Math.min(1.5, entry.duration / 3), entry.w, entry.h);
@@ -318,6 +320,7 @@ async function loadImageMedia(entry) {
   try { await img.decode(); } catch (e) {}
   if (!img.naturalWidth) throw new Error('the photo has no readable pixels');
   entry.w = img.naturalWidth; entry.h = img.naturalHeight; entry.duration = 0;
+  if (!entry.date && entry.blob && entry.blob.lastModified) entry.date = entry.blob.lastModified;
   // Phones take 12–48 MP photos; drawing those every frame is slow and memory hungry, so keep a ≤2048px copy.
   const MAX = 2048;
   if (Math.max(entry.w, entry.h) > MAX) {
@@ -506,6 +509,11 @@ function filterCss(f) {
   if (f.brightness !== 1) parts.push(`brightness(${f.brightness})`);
   if (f.contrast !== 1) parts.push(`contrast(${f.contrast})`);
   if (f.saturation !== 1) parts.push(`saturate(${f.saturation})`);
+  const temp = f.temperature || 0, tint = f.tint || 0, fade = f.fade || 0;
+  if (temp > 0) parts.push(`sepia(${(0.3 * temp).toFixed(3)}) saturate(${(1 + 0.15 * temp).toFixed(3)})`);
+  if (temp < 0) parts.push(`hue-rotate(${(-12 * -temp).toFixed(1)}deg) saturate(${(1 + 0.08 * -temp).toFixed(3)}) brightness(${(1 + 0.03 * -temp).toFixed(3)})`);
+  if (tint) parts.push(`hue-rotate(${(14 * tint).toFixed(1)}deg)`);
+  if (fade > 0) parts.push(`contrast(${(1 - 0.28 * fade).toFixed(3)}) brightness(${(1 + 0.12 * fade).toFixed(3)})`);
   return parts.join(' ') || 'none';
 }
 
@@ -589,6 +597,161 @@ function stageOverlays(loc) {
     stageGrain.style.backgroundPosition = `${Math.floor(Math.random() * 128)}px ${Math.floor(Math.random() * 128)}px`;
   } else stageGrain.style.opacity = '0';
   stageBars.style.display = f.letterbox ? 'block' : 'none';
+}
+
+const TEXT_FONTS = {
+  sans: '-apple-system, "Segoe UI", Helvetica, Arial, sans-serif',
+  display: 'Impact, "Arial Black", "Helvetica Neue", Arial, sans-serif',
+  serif: 'Georgia, "Times New Roman", Times, serif',
+  rounded: '"Arial Rounded MT Bold", "Helvetica Rounded", "Nunito", "Segoe UI", Arial, sans-serif',
+  mono: 'Menlo, Consolas, "Courier New", monospace',
+  script: '"Snell Roundhand", "Brush Script MT", "Segoe Script", cursive'
+};
+/* ---------- Stickers: emoji, text and date/time badges per clip ---------- */
+const EMOJIS = ['😀','😂','😍','🤩','😎','🥳','😜','🤙','👍','👏','🙌','✌️','🔥','⚡','💥','✨','⭐','🌟','❤️','💙','🎉','🎊','🏆','🥇','🏄','🏂','🚵','🏍️','🚗','✈️','🏕️','🏖️','🌅','🌄','🌊','🌴','⛰️','🏔️','🐶','🐱','🍕','🍻','☀️','🌈','❄️','🎵','📍','🎬'];
+const STICKER_FONTS = { emoji: '"Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif', badge: '-apple-system, "Segoe UI", Helvetica, Arial, sans-serif' };
+let selectedStickerId = null;
+function clipStickers(c) { if (!c.stickers) c.stickers = []; return c.stickers; }
+function fmtDate(ms) { try { return new Date(ms).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' }); } catch (e) { return ''; } }
+function fmtTime(ms) { try { return new Date(ms).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' }); } catch (e) { return ''; } }
+function stickerLabel(st, c) {
+  if (st.kind === 'date' || st.kind === 'time') {
+    const m = state.media.get(c.mediaId); const ms = (m && m.date) || Date.now();
+    return st.kind === 'date' ? `📅 ${fmtDate(ms)}` : `🕒 ${fmtTime(ms)}`;
+  }
+  return st.content || '';
+}
+function addSticker(kind, content) {
+  const c = selectedClip(); if (!c) { toast('Select a clip first'); return; }
+  pushUndo();
+  const spots = { emoji: [0.5, 0.5], text: [0.5, 0.85], date: [0.8, 0.1], time: [0.2, 0.1] };
+  let [x, y] = spots[kind] || [0.5, 0.5];
+  const list = clipStickers(c);
+  while (list.some(o => Math.abs(o.x - x) < 0.08 && Math.abs(o.y - y) < 0.08)) { y = y + 0.12 > 0.95 ? 0.15 : y + 0.12; x = clamp(x + 0.05, 0.1, 0.9); }
+  const st = { id: uid(), kind, content: content || '', x, y, size: kind === 'emoji' ? 0.16 : 0.09, rot: 0, anim: 'pop' };
+  list.push(st); selectedStickerId = st.id;
+  invalidate(c); renderStickerPanel(); renderTimeline(); renderAt(state.playhead); save();
+}
+/* Animation state of a sticker at local time lt: scale, extra rotation, vertical bob, opacity. */
+function stickerAnim(st, lt) {
+  const p = clamp(lt / 0.45, 0, 1);
+  let scale = 1, rot = 0, bob = 0, alpha = 1;
+  if (st.anim === 'pop') { scale = p < 1 ? 1.25 * Math.sin(p * Math.PI / 2) * (p < 0.7 ? 1 : 1) * (1 - 0.2 * Math.max(0, p - 0.7) / 0.3) : 1; alpha = Math.min(1, p * 3); }
+  else if (st.anim === 'spin') { scale = 0.2 + 0.8 * easeOut(p); rot = (1 - easeOut(p)) * 360; alpha = Math.min(1, p * 3); }
+  else if (st.anim === 'float') { bob = Math.sin(lt * 2.2) * 0.012; }
+  return { scale, rot, bob, alpha };
+}
+function drawStickers(c, lt) {
+  const list = c.stickers; if (!list || !list.length) return;
+  const cx = ctxRef.ctx;
+  list.forEach(st => {
+    const a = stickerAnim(st, lt);
+    const px = st.x * W, py = (st.y + a.bob) * H, size = st.size * H;
+    cx.save();
+    cx.globalAlpha = a.alpha; cx.translate(px, py); cx.rotate((st.rot + a.rot) * Math.PI / 180); cx.scale(a.scale, a.scale);
+    cx.textAlign = 'center'; cx.textBaseline = 'middle';
+    if (st.kind === 'emoji') {
+      cx.font = `${size}px ${STICKER_FONTS.emoji}`;
+      cx.shadowColor = 'rgba(0,0,0,0.35)'; cx.shadowBlur = size * 0.12; cx.shadowOffsetY = size * 0.04;
+      cx.fillText(st.content, 0, 0);
+    } else {
+      const label = stickerLabel(st, c);
+      const fs = st.kind === 'text' ? size : size * 0.55;
+      cx.font = `${st.kind === 'text' ? 800 : 600} ${fs}px ${STICKER_FONTS.badge}`;
+      const w = cx.measureText(label).width;
+      if (st.kind !== 'text') { cx.fillStyle = 'rgba(0,0,0,0.55)'; const padX = fs * 0.5, padY = fs * 0.3; roundRect(cx, -w / 2 - padX, -fs / 2 - padY, w + padX * 2, fs + padY * 2, fs * 0.4); cx.fill(); }
+      else { cx.shadowColor = 'rgba(0,0,0,0.6)'; cx.shadowBlur = fs * 0.15; cx.shadowOffsetY = fs * 0.04; }
+      cx.fillStyle = '#fff'; cx.fillText(label, 0, 0);
+    }
+    cx.restore();
+  });
+}
+function roundRect(cx, x, y, w, h, r) { cx.beginPath(); cx.moveTo(x + r, y); cx.arcTo(x + w, y, x + w, y + h, r); cx.arcTo(x + w, y + h, x, y + h, r); cx.arcTo(x, y + h, x, y, r); cx.arcTo(x, y, x + w, y, r); cx.closePath(); }
+/* Stage twins */
+const stageStickers = $('#stageStickers');
+let stageStickerEls = new Map();
+function stageStickersSetup(c) {
+  stageStickers.innerHTML = ''; stageStickerEls = new Map();
+  (c.stickers || []).forEach(st => {
+    const d = document.createElement('div');
+    d.className = 'stage-sticker' + (st.kind === 'emoji' || st.kind === 'text' ? '' : ' badge') + (st.id === selectedStickerId ? ' selected' : '');
+    d.dataset.id = st.id;
+    d.textContent = st.kind === 'emoji' ? st.content : stickerLabel(st, c);
+    d.style.fontFamily = st.kind === 'emoji' ? STICKER_FONTS.emoji : STICKER_FONTS.badge;
+    if (st.kind === 'text') d.style.fontWeight = 800;
+    attachStickerDrag(d, st.id);
+    stageStickers.appendChild(d); stageStickerEls.set(st.id, d);
+  });
+}
+function stageStickersUpdate(c, lt) {
+  (c.stickers || []).forEach(st => {
+    const d = stageStickerEls.get(st.id); if (!d) return;
+    const a = stickerAnim(st, lt);
+    d.style.left = `${st.x * 100}%`; d.style.top = `${(st.y + a.bob) * 100}%`;
+    d.style.fontSize = `${st.size * stageH}px`;
+    d.style.opacity = String(a.alpha);
+    d.style.transform = `translate(-50%, -50%) rotate(${st.rot + a.rot}deg) scale(${a.scale})`;
+  });
+}
+/* Dragging: on stage elements while playing, on the canvas when paused. */
+function attachStickerDrag(el, id) {
+  el.addEventListener('pointerdown', (e) => {
+    e.stopPropagation(); e.preventDefault();
+    const c = selectedClip() || (locate(state.playhead) || {}).clip; if (!c) return;
+    const st = (c.stickers || []).find(s => s.id === id); if (!st) return;
+    selectedStickerId = id; renderStickerPanel();
+    const rect = stage.getBoundingClientRect();
+    const ox = e.clientX / rect.width, oy = e.clientY / rect.height, sx = st.x, sy = st.y;
+    el.setPointerCapture(e.pointerId);
+    const move = (ev) => { st.x = clamp(sx + (ev.clientX / rect.width - ox), 0.02, 0.98); st.y = clamp(sy + (ev.clientY / rect.height - oy), 0.02, 0.98); };
+    const up = () => { el.removeEventListener('pointermove', move); el.removeEventListener('pointerup', up); el.removeEventListener('pointercancel', up); invalidate(c); save(); };
+    el.addEventListener('pointermove', move); el.addEventListener('pointerup', up); el.addEventListener('pointercancel', up);
+  });
+}
+function setupCanvasStickerDrag() {
+  let drag = null;
+  canvas.addEventListener('pointerdown', (e) => {
+    const loc = locate(state.playhead); if (!loc || !loc.clip.stickers || !loc.clip.stickers.length) return;
+    const r = canvas.getBoundingClientRect();
+    const fxp = (e.clientX - r.left) / r.width, fyp = (e.clientY - r.top) / r.height;
+    let hit = null, bestD = 1;
+    loc.clip.stickers.forEach(st => { const d = Math.hypot(fxp - st.x, fyp - st.y); const radius = st.size * 0.6 + 0.04; if (d < radius && d < bestD) { bestD = d; hit = st; } });
+    if (!hit) return;
+    e.preventDefault(); e.stopPropagation();
+    drag = { st: hit, clip: loc.clip, ox: fxp, oy: fyp, sx: hit.x, sy: hit.y, moved: false };
+    selectedStickerId = hit.id; state.selectedId = loc.clip.id; renderInspector();
+    canvas.setPointerCapture(e.pointerId);
+  }, true);
+  canvas.addEventListener('pointermove', (e) => {
+    if (!drag) return;
+    const r = canvas.getBoundingClientRect();
+    const fxp = (e.clientX - r.left) / r.width, fyp = (e.clientY - r.top) / r.height;
+    drag.st.x = clamp(drag.sx + fxp - drag.ox, 0.02, 0.98); drag.st.y = clamp(drag.sy + fyp - drag.oy, 0.02, 0.98); drag.moved = true;
+    renderAt(state.playhead);
+  });
+  const end = () => { if (!drag) return; invalidate(drag.clip); save(); const moved = drag.moved; drag = null; if (moved) setTimeout(() => { suppressCanvasClick = false; }, 0); };
+  canvas.addEventListener('pointerup', (e) => { if (drag && drag.moved) suppressCanvasClick = true; end(); });
+  canvas.addEventListener('pointercancel', end);
+}
+let suppressCanvasClick = false;
+function renderStickerPanel() {
+  const c = selectedClip();
+  $('#noClipStickers').hidden = !!c; $('#stickerEditor').hidden = !c;
+  if (!c) return;
+  const grid = $('#emojiGrid');
+  if (!grid.childElementCount) EMOJIS.forEach(e => { const b = document.createElement('button'); b.type = 'button'; b.textContent = e; b.title = 'Add sticker'; b.addEventListener('click', () => addSticker('emoji', e)); grid.appendChild(b); });
+  const list = $('#stickerList'); list.innerHTML = '';
+  const sts = c.stickers || [];
+  if (!sts.length) { list.innerHTML = '<span class="muted small-text">None yet</span>'; }
+  sts.forEach(st => {
+    const chip = document.createElement('span'); chip.className = 'chip' + (st.id === selectedStickerId ? ' active' : '');
+    chip.textContent = st.kind === 'emoji' ? st.content : (st.kind === 'text' ? `Aa ${st.content.slice(0, 12)}` : st.kind === 'date' ? '📅 date' : '🕒 time');
+    chip.addEventListener('click', () => { selectedStickerId = st.id; renderStickerPanel(); renderAt(state.playhead); });
+    list.appendChild(chip);
+  });
+  const sel = sts.find(s => s.id === selectedStickerId);
+  $('#stickerProps').hidden = !sel;
+  if (sel) { $('#stickerSize').value = sel.size; $('#stickerSizeLabel').textContent = `${Math.round(sel.size * 100)}%`; $('#stickerRot').value = sel.rot; $('#stickerRotLabel').textContent = `${sel.rot}°`; $('#stickerAnim').value = sel.anim || 'pop'; }
 }
 
 /* Reframe values at local time lt (custom keyframes interpolate zoom/pan from start to end). */
@@ -677,7 +840,7 @@ function drawText(c, lt, dur) {
   const lineH = fontSize * 1.2;
   const isLower = t.style === 'lower';
   const weight = t.style === 'minimal' ? 300 : 800;
-  const family = '-apple-system, "Segoe UI", Helvetica, Arial, sans-serif';
+  const family = TEXT_FONTS[t.font] || TEXT_FONTS.sans;
   let lines = content.split('\n');
   if (t.anim === 'typewriter') {
     const total = content.length;
@@ -686,7 +849,7 @@ function drawText(c, lt, dur) {
     lines = lines.map(l => { const s = l.slice(0, Math.max(0, remain)); remain -= l.length + 1; return s; });
   }
   cx.save();
-  cx.globalAlpha = (t.anim === 'fade' || t.anim === 'slideUp' ? p : 1) * outP;
+  cx.globalAlpha = (t.anim === 'fade' || t.anim === 'slideUp' || t.anim === 'zoomIn' || t.anim === 'slideLeft' ? p : 1) * outP;
   cx.font = `${weight} ${fontSize}px ${family}`;
   cx.textBaseline = 'middle';
   cx.textAlign = isLower ? 'left' : 'center';
@@ -697,9 +860,13 @@ function drawText(c, lt, dur) {
   else if (t.pos === 'bottom') y0 = H * 0.86 - (lines.length - 1) * lineH;
   else y0 = H / 2 - (lines.length - 1) * lineH / 2;
   let dy = 0, scale = 1;
+  let dxA = 0;
   if (t.anim === 'slideUp') dy = (1 - easeOut(p)) * fontSize * 0.8;
   if (t.anim === 'pop') scale = 0.6 + 0.4 * easeOut(p);
-  cx.translate(x, y0 + dy); cx.scale(scale, scale); cx.translate(-x, -(y0 + dy));
+  if (t.anim === 'zoomIn') scale = 1.35 - 0.35 * easeOut(p);
+  if (t.anim === 'slideLeft') dxA = (1 - easeOut(p)) * W * 0.25;
+  if (t.anim === 'bounce') scale = p < 1 ? 1 + 0.25 * Math.sin(p * Math.PI) * (1 - p) + (p < 0.3 ? -(0.3 - p) * 2 : 0) : 1;
+  cx.translate(x + dxA, y0 + dy); cx.scale(scale, scale); cx.translate(-x, -(y0 + dy));
   cx.shadowColor = 'rgba(0,0,0,0.6)'; cx.shadowBlur = fontSize * 0.15; cx.shadowOffsetY = fontSize * 0.04;
   lines.forEach((line, i) => {
     const y = y0 + dy + i * lineH;
@@ -818,6 +985,7 @@ function drawFrameNow(loc, srcEl = null) {
   const el = srcEl || (clip.kind === 'video' ? playerForIdx(idx).el : m.el);
   drawSource(clip, m, el, lt, dur, { idx, t: loc.offset + lt });
   drawText(clip, lt, dur);
+  drawStickers(clip, lt);
   drawTransition(clip, idx, lt);
   drawOverlays(loc);
 }
@@ -870,6 +1038,7 @@ function showStage(on) {
     state.media.forEach(m => { if (m.el && m.el.style) m.el.style.visibility = 'hidden'; });
     stagePrev.style.display = 'none'; stageOverlay.style.background = 'transparent'; stageText.innerHTML = ''; stageTextEl = null; stageClip = null;
     stageLeak.style.opacity = '0'; stageGrain.style.opacity = '0'; stageBars.style.display = 'none';
+    stageStickers.innerHTML = ''; stageStickerEls = new Map();
   }
 }
 /* Same geometry as drawSource(), expressed in percentages of the stage. */
@@ -915,6 +1084,7 @@ function stageSetup(loc) {
     d.className = 'stage-text';
     const isLower = t.style === 'lower';
     d.style.fontWeight = t.style === 'minimal' ? 300 : 800;
+    d.style.fontFamily = TEXT_FONTS[t.font] || TEXT_FONTS.sans;
     d.style.fontSize = `${t.size * stageH}px`;
     d.style.color = t.color;
     d.style.textAlign = isLower ? 'left' : 'center';
@@ -932,6 +1102,7 @@ function stageSetup(loc) {
     stageText.appendChild(d);
     stageTextEl = d;
   }
+  stageStickersSetup(clip);
   // Transition source: last frame of the previous clip
   const tr = clip.transition;
   stagePrev.style.display = 'none';
@@ -959,6 +1130,7 @@ function stageUpdate(loc) {
   const m = state.media.get(clip.mediaId);
   const el = clip.kind === 'video' ? playerForIdx(idx).el : (m && m.el);
   if (m && el) placeStageEl(clip, m, lt, dur, el, idx, loc.offset + lt);   // motion, pulse and push/whip move every frame
+  stageStickersUpdate(clip, lt);
   stageOverlays(loc);
   if (stageTextEl) {
     const t = clip.text;
@@ -971,6 +1143,9 @@ function stageUpdate(loc) {
       if (t.anim === 'fade' || t.anim === 'slideUp') opacity *= p;
       if (t.anim === 'slideUp') extra = ` translateY(${(1 - easeOut(p)) * 0.8}em)`;
       if (t.anim === 'pop') extra = ` scale(${0.6 + 0.4 * easeOut(p)})`;
+      if (t.anim === 'zoomIn') { extra = ` scale(${1.35 - 0.35 * easeOut(p)})`; opacity *= p; }
+      if (t.anim === 'slideLeft') { extra = ` translateX(${(1 - easeOut(p)) * 25}vw)`; opacity *= p; }
+      if (t.anim === 'bounce') extra = ` scale(${p < 1 ? 1 + 0.25 * Math.sin(p * Math.PI) * (1 - p) + (p < 0.3 ? -(0.3 - p) * 2 : 0) : 1})`;
       if (t.anim === 'typewriter') {
         const full = t.content.trim();
         const want = full.slice(0, Math.floor(clamp(lt / Math.min(1.5, showDur), 0, 1) * full.length));
@@ -2440,6 +2615,7 @@ async function renderClipLastFrameExport(clip, idx) {
   ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
   drawSource(clip, m, el, dur, dur);
   drawText(clip, dur, dur);
+  drawStickers(clip, dur);
   const out = snapshotCanvas();
   ctx.drawImage(saved, 0, 0);
   return out;
@@ -2993,6 +3169,7 @@ function renderTimeline() {
     if (clip.rotate || clip.rot90 || clip.flipH || clip.flipV) badges.push('↻');
     if (clip.filter.preset !== 'none') badges.push(FILTERS[clip.filter.preset].name);
     if (clip.text.content.trim()) badges.push('T');
+    if (clip.stickers && clip.stickers.length) badges.push(clip.stickers[0].kind === 'emoji' ? clip.stickers[0].content : '🏷');
     if (clip.volume === 0 && clip.kind === 'video') badges.push('🔇');
     d.innerHTML = (clip.transition.type !== 'none' ? '<div class="trans"></div>' : '') +
       `<div class="badges">${badges.map(b => `<span class="badge">${b}</span>`).join('')}</div>` +
@@ -3099,6 +3276,7 @@ function renderInspector() {
   const pr = prefs(); $('#prefPeople').checked = pr.people; $('#prefViews').checked = pr.views; $('#prefAction').checked = pr.action;
   renderLengthControl();
   renderFxPanel();
+  renderStickerPanel();
   renderMusicPanel();
   $('#projectTitle').value = P().title; $('#projectTitleMobile').value = P().title;
   if (!c || !m) return;
@@ -3147,10 +3325,15 @@ function renderInspector() {
   $('#contrast').value = c.filter.contrast; $('#contrastLabel').textContent = c.filter.contrast.toFixed(2);
   $('#saturation').value = c.filter.saturation; $('#saturationLabel').textContent = c.filter.saturation.toFixed(2);
   $('#vignette').value = c.filter.vignette; $('#vignetteLabel').textContent = c.filter.vignette.toFixed(2);
+  const tp = c.filter.temperature || 0, tn = c.filter.tint || 0, fd = c.filter.fade || 0;
+  $('#temperature').value = tp; $('#temperatureLabel').textContent = tp > 0 ? `warm ${Math.round(tp * 100)}%` : tp < 0 ? `cool ${Math.round(-tp * 100)}%` : 'neutral';
+  $('#tint').value = tn; $('#tintLabel').textContent = tn > 0 ? `magenta ${Math.round(tn * 100)}%` : tn < 0 ? `green ${Math.round(-tn * 100)}%` : 'neutral';
+  $('#fadeAmt').value = fd; $('#fadeLabel').textContent = fd ? `${Math.round(fd * 100)}%` : 'off';
 
   $('#textContent').value = c.text.content;
   setSeg('textPosSeg', 'pos', c.text.pos);
   $('#textStyle').value = c.text.style;
+  $('#textFont').value = c.text.font || 'sans';
   $('#textSize').value = c.text.size; $('#textSizeLabel').textContent = `${Math.round(c.text.size * 100)}%`;
   $('#textColor').value = c.text.color; $('#textAccent').value = c.text.accent;
   $('#textAnim').value = c.text.anim;
@@ -3342,7 +3525,19 @@ function bindUI() {
   $('#splitBtn').addEventListener('click', () => { pause(); splitAtPlayhead(); });
   $('#frameGrabBtn').addEventListener('click', frameGrab);
   $('#fullscreenBtn').addEventListener('click', () => { const w = $('#previewWrap'); if (document.fullscreenElement) document.exitFullscreen(); else if (w.requestFullscreen) w.requestFullscreen(); });
-  canvas.addEventListener('click', () => { if (P().clips.length) togglePlay(); });
+  canvas.addEventListener('click', () => { if (suppressCanvasClick) { suppressCanvasClick = false; return; } if (P().clips.length) togglePlay(); });
+  setupCanvasStickerDrag();
+  $('#addTextStickerBtn').addEventListener('click', () => { const txt = prompt('Sticker text'); if (txt && txt.trim()) addSticker('text', txt.trim()); });
+  $('#addDateStickerBtn').addEventListener('click', () => addSticker('date'));
+  $('#addTimeStickerBtn').addEventListener('click', () => addSticker('time'));
+  const curSticker = () => { const c = selectedClip(); return c && (c.stickers || []).find(s => s.id === selectedStickerId) ? { c, st: c.stickers.find(s => s.id === selectedStickerId) } : null; };
+  $('#stickerSize').addEventListener('input', (e) => { const x = curSticker(); if (!x) return; x.st.size = Number(e.target.value); $('#stickerSizeLabel').textContent = `${Math.round(x.st.size * 100)}%`; invalidate(x.c); renderAt(state.playhead); });
+  $('#stickerSize').addEventListener('change', save);
+  $('#stickerRot').addEventListener('input', (e) => { const x = curSticker(); if (!x) return; x.st.rot = Number(e.target.value); $('#stickerRotLabel').textContent = `${x.st.rot}°`; invalidate(x.c); renderAt(state.playhead); });
+  $('#stickerRot').addEventListener('change', save);
+  $('#stickerAnim').addEventListener('change', (e) => { const x = curSticker(); if (!x) return; pushUndo(); x.st.anim = e.target.value; save(); });
+  $('#stickerCenterBtn').addEventListener('click', () => { const x = curSticker(); if (!x) return; pushUndo(); x.st.x = 0.5; x.st.y = 0.5; invalidate(x.c); renderAt(state.playhead); save(); });
+  $('#stickerDeleteBtn').addEventListener('click', () => { const x = curSticker(); if (!x) return; pushUndo(); x.c.stickers = x.c.stickers.filter(s => s.id !== x.st.id); selectedStickerId = null; invalidate(x.c); renderStickerPanel(); renderTimeline(); renderAt(state.playhead); save(); });
   stage.addEventListener('click', () => { if (P().clips.length) togglePlay(); });
   window.addEventListener('resize', () => { if (state.playing) sizeStage(); });
   document.addEventListener('fullscreenchange', () => setTimeout(() => { if (state.playing) sizeStage(); }, 50));
@@ -3401,6 +3596,9 @@ function bindUI() {
   bindRange('#contrast', (v, c) => { c.filter.contrast = v; $('#contrastLabel').textContent = v.toFixed(2); });
   bindRange('#saturation', (v, c) => { c.filter.saturation = v; $('#saturationLabel').textContent = v.toFixed(2); });
   bindRange('#vignette', (v, c) => { c.filter.vignette = v; $('#vignetteLabel').textContent = v.toFixed(2); });
+  bindRange('#temperature', (v, c) => { c.filter.temperature = v; $('#temperatureLabel').textContent = v > 0 ? `warm ${Math.round(v * 100)}%` : v < 0 ? `cool ${Math.round(-v * 100)}%` : 'neutral'; });
+  bindRange('#tint', (v, c) => { c.filter.tint = v; $('#tintLabel').textContent = v > 0 ? `magenta ${Math.round(v * 100)}%` : v < 0 ? `green ${Math.round(-v * 100)}%` : 'neutral'; });
+  bindRange('#fadeAmt', (v, c) => { c.filter.fade = v; $('#fadeLabel').textContent = v ? `${Math.round(v * 100)}%` : 'off'; });
   $('#applyStyleAllBtn').addEventListener('click', () => {
     const c = selectedClip(); if (!c) { toast('Select a clip whose look you want to copy'); return; }
     pushUndo();
@@ -3417,6 +3615,7 @@ function bindUI() {
   $('#textContent').addEventListener('change', (e) => { e.target._gesture = false; renderTimeline(); save(); });
   bindSeg('textPosSeg', 'pos', (v, c) => { c.text.pos = v; });
   bindSelect('#textStyle', (v, c) => { c.text.style = v; });
+  bindSelect('#textFont', (v, c) => { c.text.font = v; });
   bindRange('#textSize', (v, c) => { c.text.size = v; $('#textSizeLabel').textContent = `${Math.round(v * 100)}%`; });
   $('#textColor').addEventListener('input', (e) => { const c = selectedClip(); if (!c) return; if (!e.target._g) { pushUndo(); e.target._g = true; } c.text.color = e.target.value; invalidate(c); renderAt(state.playhead); });
   $('#textColor').addEventListener('change', (e) => { e.target._g = false; save(); });
@@ -3560,5 +3759,5 @@ window.addEventListener('error', (e) => { if (e && e.message) toast(`Error: ${e.
 window.addEventListener('unhandledrejection', (e) => { const r = e && e.reason; toast(`Error: ${r && r.message ? r.message : r}`, 6000); });
 
 /* Exposed for debugging / tests */
-window.QuikWeb = { segmentsOf, srcTimeAt, speedAt, setClipDurationTo, randomizeEffects, ensureFaceApi, peopleScore, faceApiState: () => faceApiState, findDuplicateMedia, removeDuplicateMedia, diagnosticsText, ensureAnalyzed, pickWindows, dedupeClips, uniqueMedia, sceneSimilarity, HAS_WEBCODECS, startOfflineExport, audioFallback, setExportMode: (m) => { exportMode = m; }, audioBufferCache, normalizeAacDescription, aacLcConfig, players, scratch, planEdit, fitToLength, targetSeconds, state, importFiles, addToTimeline, autoCreate, applyTheme, beatSync, play, pause, setPlayhead, renderAt, totalDuration, layout, setMusic, splitAtPlayhead, startExport, pickMime, useLibraryTrack, loadLibrary };
+window.QuikWeb = { addSticker, EMOJIS, segmentsOf, srcTimeAt, speedAt, setClipDurationTo, randomizeEffects, ensureFaceApi, peopleScore, faceApiState: () => faceApiState, findDuplicateMedia, removeDuplicateMedia, diagnosticsText, ensureAnalyzed, pickWindows, dedupeClips, uniqueMedia, sceneSimilarity, HAS_WEBCODECS, startOfflineExport, audioFallback, setExportMode: (m) => { exportMode = m; }, audioBufferCache, normalizeAacDescription, aacLcConfig, players, scratch, planEdit, fitToLength, targetSeconds, state, importFiles, addToTimeline, autoCreate, applyTheme, beatSync, play, pause, setPlayhead, renderAt, totalDuration, layout, setMusic, splitAtPlayhead, startExport, pickMime, useLibraryTrack, loadLibrary };
 })();

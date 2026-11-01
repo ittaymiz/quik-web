@@ -103,6 +103,15 @@ button:disabled { opacity: 0.5; cursor: default; filter: none; }
 .stage-bars { display: none; }
 .stage-bars .bar { position: absolute; left: 0; right: 0; background: #000; height: 9%; }
 .stage-bars .bar.top { top: 0; } .stage-bars .bar.bottom { bottom: 0; }
+.emoji-grid { display: grid; grid-template-columns: repeat(8, 1fr); gap: 4px; }
+.emoji-grid button { border: 1px solid var(--border); background: var(--panel-2); border-radius: 8px; font-size: 20px; padding: 4px 0; }
+.chip-row { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip { border: 1px solid var(--border); background: var(--panel-2); border-radius: 14px; padding: 3px 10px; font-size: 13px; cursor: pointer; }
+.chip.active { border-color: var(--accent); background: rgba(79,140,255,.18); }
+.stage-stickers { pointer-events: none; }
+.stage-sticker { position: absolute; transform: translate(-50%, -50%); white-space: nowrap; pointer-events: auto; cursor: grab; text-shadow: 0 0.04em 0.15em rgba(0,0,0,0.55); line-height: 1; user-select: none; -webkit-user-select: none; touch-action: none; }
+.stage-sticker.badge { background: rgba(0,0,0,0.55); color: #fff; border-radius: 0.4em; padding: 0.25em 0.5em; font-weight: 600; font-size: 0.55em; text-shadow: none; }
+.stage-sticker.selected { outline: 2px dashed var(--accent); outline-offset: 4px; }
 .stage-text { position: absolute; white-space: pre-line; line-height: 1.2; font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; text-shadow: 0 0.04em 0.15em rgba(0,0,0,0.6); will-change: transform, opacity; }
 
 /* ---------- Inspector ---------- */
