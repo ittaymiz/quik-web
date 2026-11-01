@@ -21,7 +21,7 @@ const ASPECTS = { '16:9': [16, 9], '9:16': [9, 16], '1:1': [1, 1], '4:5': [4, 5]
 const PREVIEW_LONG = window.matchMedia('(max-width: 760px)').matches ? 960 : 1280;
 const MIN_CLIP = 1.0;
 /* Effects on by default: camera motion, beat pulse, light leaks, a touch of grain. */
-const FX_DEFAULT = { motion: 0.6, pulse: true, letterbox: false, leaks: true, grain: 0.08 };
+const FX_DEFAULT = { motion: 0.6, pulse: true, letterbox: false, leaks: true, grain: 0.08, particles: 'none', autoSlowmo: true };
 const IS_IOS = /iP(hone|ad|od)/.test(navigator.platform) || (navigator.userAgent.includes('Mac') && 'ontouchend' in document);
 const HAS_CTX_FILTER = (() => { try { const c = document.createElement('canvas').getContext('2d'); return typeof c.filter === 'string'; } catch (e) { return false; } })();
 const phoneLayout = window.matchMedia('(max-width: 760px), (pointer: coarse) and (max-height: 500px)');
@@ -187,7 +187,7 @@ function save() {
   clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
     DB.putKV('project', JSON.parse(JSON.stringify(P())));
-    DB.putKV('media', Array.from(state.media.values()).map(m => ({ id: m.id, kind: m.kind, name: m.name, scores: m.scores || null, date: m.date || null })));
+    DB.putKV('media', Array.from(state.media.values()).map(m => ({ id: m.id, kind: m.kind, name: m.name, scores: m.scores || null, date: m.date || null, hilights: m.hilights || [] })));
   }, 300);
 }
 
@@ -560,9 +560,68 @@ function getNoise() {
   return c;
 }
 function leakAlpha(lt, clip) { const f = fx(); if (!f.leaks || (clip && clip.leak === false)) return 0; const p = lt / 1.2; return p >= 0 && p < 1 ? 0.5 * Math.sin(Math.PI * p) : 0; }
-/* Canvas overlays: light leak, grain, letterbox. */
+/* ---------- Particle graphics (stateless: every frame is a function of time, so preview = export) ---------- */
+const PARTICLE_KINDS = {
+  snow:     { n: 80,  size: [2, 6],   fall: [35, 80],   drift: 25,  alpha: 0.9 },
+  bokeh:    { n: 26,  size: [16, 64], fall: [-10, 6],   drift: 12,  alpha: 0.22 },
+  sparkles: { n: 50,  size: [2, 5],   fall: [-6, 6],    drift: 8,   alpha: 1 },
+  confetti: { n: 70,  size: [5, 10],  fall: [80, 160],  drift: 70,  alpha: 0.95 },
+  rain:     { n: 120, size: [1, 2],   fall: [600, 900], drift: 120, alpha: 0.35 },
+  dust:     { n: 45,  size: [1.5, 4], fall: [-12, 12],  drift: 18,  alpha: 0.5 }
+};
+const CONFETTI_COLORS = ['#ff4d6d', '#ffd166', '#06d6a0', '#4cc9f0', '#f72585', '#ffffff', '#b5179e'];
+function prand(i, k) { const x = Math.sin(i * 12.9898 + k * 78.233 + 0.5) * 43758.5453; return x - Math.floor(x); }
+/* Draws the particle field for project time t onto cx sized w×h. */
+function drawParticles(cx, kind, t, w, h) {
+  const P_ = PARTICLE_KINDS[kind]; if (!P_) return;
+  const base = Math.min(w, h) / 540;   // scale sizes with resolution
+  cx.save();
+  for (let i = 0; i < P_.n; i++) {
+    const r1 = prand(i, 1), r2 = prand(i, 2), r3 = prand(i, 3), r4 = prand(i, 4), r5 = prand(i, 5);
+    const size = (P_.size[0] + (P_.size[1] - P_.size[0]) * r3) * base;
+    const fall = P_.fall[0] + (P_.fall[1] - P_.fall[0]) * r4;
+    const sway = Math.sin(t * (0.6 + r5 * 1.2) + i) * P_.drift * base;
+    let x = ((r1 * w + sway + (kind === 'rain' ? -t * 60 * base : t * (r5 - 0.5) * 20 * base)) % w + w) % w;
+    let y = ((r2 * h + t * fall * base) % h + h) % h;
+    if (kind === 'snow') { cx.globalAlpha = P_.alpha * (0.5 + 0.5 * r5); cx.fillStyle = '#fff'; cx.beginPath(); cx.arc(x, y, size / 2, 0, Math.PI * 2); cx.fill(); }
+    else if (kind === 'bokeh') {
+      const g = cx.createRadialGradient(x, y, 0, x, y, size / 2);
+      const hue = 25 + r5 * 40; g.addColorStop(0, `hsla(${hue},90%,80%,${P_.alpha})`); g.addColorStop(0.7, `hsla(${hue},90%,70%,${P_.alpha * 0.6})`); g.addColorStop(1, 'rgba(255,255,255,0)');
+      cx.globalAlpha = 0.6 + 0.4 * Math.sin(t * 0.8 + i); cx.fillStyle = g; cx.beginPath(); cx.arc(x, y, size / 2, 0, Math.PI * 2); cx.fill();
+    } else if (kind === 'sparkles') {
+      const tw = Math.max(0, Math.sin(t * (2 + r5 * 4) + i * 1.7));
+      if (tw < 0.2) continue;
+      cx.globalAlpha = tw; cx.fillStyle = '#fff'; cx.translate(x, y); cx.rotate(Math.PI / 4 * r4);
+      cx.fillRect(-size * 1.6, -size * 0.25, size * 3.2, size * 0.5); cx.fillRect(-size * 0.25, -size * 1.6, size * 0.5, size * 3.2);
+      cx.setTransform(1, 0, 0, 1, 0, 0);
+    } else if (kind === 'confetti') {
+      cx.globalAlpha = P_.alpha; cx.fillStyle = CONFETTI_COLORS[i % CONFETTI_COLORS.length];
+      cx.translate(x, y); cx.rotate(t * (2 + r5 * 4) + i); cx.fillRect(-size / 2, -size / 4, size, size / 2); cx.setTransform(1, 0, 0, 1, 0, 0);
+    } else if (kind === 'rain') {
+      cx.globalAlpha = P_.alpha * (0.5 + 0.5 * r5); cx.strokeStyle = '#cfe6ff'; cx.lineWidth = size;
+      cx.beginPath(); cx.moveTo(x, y); cx.lineTo(x - 6 * base, y + 22 * base * (0.6 + r3)); cx.stroke();
+    } else if (kind === 'dust') {
+      cx.globalAlpha = P_.alpha * (0.3 + 0.7 * Math.abs(Math.sin(t * 0.7 + i))); cx.fillStyle = '#fff7e0'; cx.beginPath(); cx.arc(x, y, size / 2, 0, Math.PI * 2); cx.fill();
+    }
+  }
+  cx.restore();
+}
+const stageParticles = $('#stageParticles');
+const stageParticlesCtx = stageParticles.getContext('2d');
+function stageParticlesUpdate(t) {
+  const kind = fx().particles;
+  if (!kind || kind === 'none' || !PARTICLE_KINDS[kind]) { stageParticles.style.display = 'none'; return; }
+  const ar = W / H, pw = 640, ph = Math.round(640 / ar);
+  if (stageParticles.width !== pw || stageParticles.height !== ph) { stageParticles.width = pw; stageParticles.height = ph; }
+  stageParticles.style.display = 'block';
+  stageParticlesCtx.clearRect(0, 0, pw, ph);
+  drawParticles(stageParticlesCtx, kind, t, pw, ph);
+}
+
+/* Canvas overlays: light leak, particles, grain, letterbox. */
 function drawOverlays(loc) {
   const cx = ctxRef.ctx; const f = fx();
+  if (f.particles && f.particles !== 'none' && loc) drawParticles(cx, f.particles, loc.offset + loc.lt, W, H);
   const la = loc ? leakAlpha(loc.lt, loc.clip) : 0;
   if (la > 0) {
     const p = loc.lt / 1.2;
@@ -597,6 +656,7 @@ function stageOverlays(loc) {
     stageGrain.style.backgroundPosition = `${Math.floor(Math.random() * 128)}px ${Math.floor(Math.random() * 128)}px`;
   } else stageGrain.style.opacity = '0';
   stageBars.style.display = f.letterbox ? 'block' : 'none';
+  stageParticlesUpdate(loc ? loc.offset + loc.lt : 0);
 }
 
 const TEXT_FONTS = {
@@ -1037,7 +1097,7 @@ function showStage(on) {
     players.forEach(p => { p.el.style.visibility = 'hidden'; });
     state.media.forEach(m => { if (m.el && m.el.style) m.el.style.visibility = 'hidden'; });
     stagePrev.style.display = 'none'; stageOverlay.style.background = 'transparent'; stageText.innerHTML = ''; stageTextEl = null; stageClip = null;
-    stageLeak.style.opacity = '0'; stageGrain.style.opacity = '0'; stageBars.style.display = 'none';
+    stageLeak.style.opacity = '0'; stageGrain.style.opacity = '0'; stageBars.style.display = 'none'; stageParticles.style.display = 'none';
     stageStickers.innerHTML = ''; stageStickerEls = new Map();
   }
 }
@@ -1747,12 +1807,24 @@ function uniqueMedia(list, strict) {
 }
 /* Average interest of the window [s, s+len] of a video (0.5 when unknown). */
 function windowScore(m, s, len) {
-  const sc = m.scores; if (!sc || !(sc.tech || sc.values)) return 0.5;
+  const hl = (m.hilights || []).some(t => t >= s && t <= s + len) ? 0.9 : 0;   // a HiLight makes the window win
+  const sc = m.scores; if (!sc || !(sc.tech || sc.values)) return 0.5 + hl;
   const count = (sc.tech || sc.values).length;
   let sum = 0, n = 0, peak = 0;
   for (let i = 0; i < count; i++) { const t = (i + 0.5) * sc.step; if (t >= s - 0.25 && t <= s + len + 0.25) { const v = interestAt(sc, i); sum += v; peak = Math.max(peak, v); n++; } }
-  if (!n) return 0.5;
-  return 0.7 * (sum / n) + 0.3 * peak;   // a strong moment inside the window counts
+  if (!n) return 0.5 + hl;
+  return 0.7 * (sum / n) + 0.3 * peak + hl;   // a strong moment inside the window counts
+}
+function addHiLight() {
+  const loc = locate(state.playhead); const c = selectedClip();
+  if (!loc || !c || loc.clip.id !== c.id || c.kind !== 'video') { toast('Move the playhead inside the selected video clip'); return; }
+  const m = state.media.get(c.mediaId); if (!m) return;
+  const t = srcTimeAt(c, loc.lt);
+  m.hilights = m.hilights || [];
+  if (m.hilights.some(h => Math.abs(h - t) < 1)) { toast('There is already a HiLight here'); return; }
+  m.hilights.push(t); m.hilights.sort((a, b) => a - b);
+  renderAll(); save();
+  toast(`⭐ HiLight at ${fmt(t)} of ${m.name} – Auto Create will keep this moment`);
 }
 /* Picks k non-overlapping windows of length len in a video, best interest first, spread out. */
 function pickWindows(m, k, len) {
@@ -3088,7 +3160,7 @@ function renderMediaGrid() {
   state.media.forEach(m => {
     const d = document.createElement('div');
     d.className = 'media-item'; d.title = `${m.name} – click to add to timeline`;
-    d.innerHTML = `<img src="${m.thumb}" alt=""><span class="kind">${m.kind === 'video' ? '▶' : '🖼'}</span>` +
+    d.innerHTML = `<img src="${m.thumb}" alt=""><span class="kind">${m.kind === 'video' ? '▶' : '🖼'}${m.hilights && m.hilights.length ? ` ⭐${m.hilights.length}` : ''}</span>` +
       (m.kind === 'video' ? `<span class="dur">${fmt(m.duration)}</span>` : '') +
       `<button class="rm" title="Remove from media bin">✕</button>`;
     d.addEventListener('click', () => addToTimeline([m.id]));
@@ -3170,6 +3242,7 @@ function renderTimeline() {
     if (clip.filter.preset !== 'none') badges.push(FILTERS[clip.filter.preset].name);
     if (clip.text.content.trim()) badges.push('T');
     if (clip.stickers && clip.stickers.length) badges.push(clip.stickers[0].kind === 'emoji' ? clip.stickers[0].content : '🏷');
+    if (m && m.hilights && m.hilights.some(h => h >= clip.start && h <= clip.end)) badges.push('⭐');
     if (clip.volume === 0 && clip.kind === 'video') badges.push('🔇');
     d.innerHTML = (clip.transition.type !== 'none' ? '<div class="trans"></div>' : '') +
       `<div class="badges">${badges.map(b => `<span class="badge">${b}</span>`).join('')}</div>` +
@@ -3281,7 +3354,9 @@ function renderInspector() {
   $('#projectTitle').value = P().title; $('#projectTitleMobile').value = P().title;
   if (!c || !m) return;
 
-  $('#clipName').textContent = `${c.kind === 'video' ? '▶' : '🖼'} ${c.name}`;
+  $('#clipName').textContent = `${c.kind === 'video' ? '▶' : '🖼'} ${c.name}${m.hilights && m.hilights.length ? ` · ⭐${m.hilights.length}` : ''}`;
+  $('#hilightBtn').parentElement.style.display = c.kind === 'video' ? '' : 'none';
+  $('#hilightClearBtn').hidden = !(m.hilights && m.hilights.length);
   const isVideo = c.kind === 'video';
   $('#trimSlider').style.display = isVideo ? '' : 'none';
   $('#filmstrip').style.display = isVideo ? '' : 'none';
@@ -3392,6 +3467,7 @@ function renderFxPanel() {
   $('#fxMotion').value = f.motion; $('#fxMotionLabel').textContent = f.motion ? `${Math.round(f.motion * 100)}%` : 'off';
   $('#fxPulse').checked = !!f.pulse; $('#fxLetterbox').checked = !!f.letterbox; $('#fxLeaks').checked = !!f.leaks;
   $('#fxGrain').value = f.grain; $('#fxGrainLabel').textContent = f.grain ? `${Math.round(f.grain * 100)}%` : 'off';
+  $('#fxParticles').value = f.particles || 'none';
   $('#clipMotionRow').hidden = !(c && c.kind === 'video');
   $('#clipLeakRow').hidden = !c;
   if (c) { $('#clipMotion').value = c.motion || 'auto'; $('#clipLeak').checked = c.leak !== false; }
@@ -3561,6 +3637,8 @@ function bindUI() {
     if (c.end - t < MIN_CLIP * c.speed) return;
     pushUndo(); c.start = t; invalidate(c); renderAll(); save();
   });
+  $('#hilightBtn').addEventListener('click', addHiLight);
+  $('#hilightClearBtn').addEventListener('click', () => { const c = selectedClip(); const m = c && state.media.get(c.mediaId); if (!m) return; m.hilights = []; renderAll(); save(); toast('HiLights removed'); });
   $('#setOutBtn').addEventListener('click', () => {
     const loc = locate(state.playhead); const c = selectedClip();
     if (!loc || !c || loc.clip.id !== c.id || c.kind !== 'video') { toast('Move the playhead inside the selected clip'); return; }
@@ -3672,6 +3750,7 @@ function bindUI() {
   const fxSet = (patch) => { P().fx = { ...fx(), ...patch }; state.snapCache.clear(); renderFxPanel(); renderAt(state.playhead); save(); };
   $('#fxMotion').addEventListener('input', (e) => fxSet({ motion: Number(e.target.value) }));
   $('#fxGrain').addEventListener('input', (e) => fxSet({ grain: Number(e.target.value) }));
+  $('#fxParticles').addEventListener('change', (e) => fxSet({ particles: e.target.value }));
   $('#fxPulse').addEventListener('change', (e) => fxSet({ pulse: e.target.checked }));
   $('#fxLetterbox').addEventListener('change', (e) => fxSet({ letterbox: e.target.checked }));
   $('#fxLeaks').addEventListener('change', (e) => fxSet({ leaks: e.target.checked }));
@@ -3759,5 +3838,5 @@ window.addEventListener('error', (e) => { if (e && e.message) toast(`Error: ${e.
 window.addEventListener('unhandledrejection', (e) => { const r = e && e.reason; toast(`Error: ${r && r.message ? r.message : r}`, 6000); });
 
 /* Exposed for debugging / tests */
-window.QuikWeb = { addSticker, EMOJIS, segmentsOf, srcTimeAt, speedAt, setClipDurationTo, randomizeEffects, ensureFaceApi, peopleScore, faceApiState: () => faceApiState, findDuplicateMedia, removeDuplicateMedia, diagnosticsText, ensureAnalyzed, pickWindows, dedupeClips, uniqueMedia, sceneSimilarity, HAS_WEBCODECS, startOfflineExport, audioFallback, setExportMode: (m) => { exportMode = m; }, audioBufferCache, normalizeAacDescription, aacLcConfig, players, scratch, planEdit, fitToLength, targetSeconds, state, importFiles, addToTimeline, autoCreate, applyTheme, beatSync, play, pause, setPlayhead, renderAt, totalDuration, layout, setMusic, splitAtPlayhead, startExport, pickMime, useLibraryTrack, loadLibrary };
+window.QuikWeb = { addHiLight, drawParticles, PARTICLE_KINDS, addSticker, EMOJIS, segmentsOf, srcTimeAt, speedAt, setClipDurationTo, randomizeEffects, ensureFaceApi, peopleScore, faceApiState: () => faceApiState, findDuplicateMedia, removeDuplicateMedia, diagnosticsText, ensureAnalyzed, pickWindows, dedupeClips, uniqueMedia, sceneSimilarity, HAS_WEBCODECS, startOfflineExport, audioFallback, setExportMode: (m) => { exportMode = m; }, audioBufferCache, normalizeAacDescription, aacLcConfig, players, scratch, planEdit, fitToLength, targetSeconds, state, importFiles, addToTimeline, autoCreate, applyTheme, beatSync, play, pause, setPlayhead, renderAt, totalDuration, layout, setMusic, splitAtPlayhead, startExport, pickMime, useLibraryTrack, loadLibrary };
 })();

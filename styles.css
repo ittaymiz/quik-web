@@ -99,6 +99,7 @@ button:disabled { opacity: 0.5; cursor: default; filter: none; }
 .stage-el { position: absolute; visibility: hidden; pointer-events: none; will-change: transform; }
 .stage-prev { position: absolute; left: 0; top: 0; width: 100%; height: 100%; pointer-events: none; display: none; transform-origin: center; }
 .stage-leak { mix-blend-mode: screen; opacity: 0; }
+.stage-particles { width: 100%; height: 100%; display: none; }
 .stage-grain { mix-blend-mode: overlay; opacity: 0; background-repeat: repeat; background-size: 128px 128px; }
 .stage-bars { display: none; }
 .stage-bars .bar { position: absolute; left: 0; right: 0; background: #000; height: 9%; }

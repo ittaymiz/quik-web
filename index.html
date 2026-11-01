@@ -69,6 +69,7 @@
           <div id="stageText" class="stage-layer"></div>
           <div id="stageStickers" class="stage-layer stage-stickers"></div>
           <div id="stageOverlay" class="stage-layer"></div>
+          <canvas id="stageParticles" class="stage-layer stage-particles" width="640" height="360"></canvas>
           <div id="stageGrain" class="stage-layer stage-grain"></div>
           <div id="stageBars" class="stage-layer stage-bars"><div class="bar top"></div><div class="bar bottom"></div></div>
         </div>
@@ -129,6 +130,10 @@
           <div class="field-row">
             <button id="setInBtn" class="small-btn" title="Set trim start at playhead ([)">[ Set start</button>
             <button id="setOutBtn" class="small-btn" title="Set trim end at playhead (])">Set end ]</button>
+          </div>
+          <div class="field-row">
+            <button id="hilightBtn" class="small-btn wide" title="Mark this moment as a highlight: Auto Create will always try to include it">⭐ HiLight this moment</button>
+            <button id="hilightClearBtn" class="small-btn" title="Remove the HiLights of this file" hidden>✕</button>
           </div>
 
           <div id="imageDurationRow">
@@ -331,6 +336,16 @@
         <label class="check"><input type="checkbox" id="fxPulse"> Pulse on the beat</label>
         <label class="check"><input type="checkbox" id="fxLetterbox"> Cinematic letterbox bars</label>
         <label class="check"><input type="checkbox" id="fxLeaks"> Light leaks at each cut</label>
+        <label class="field-label">Particles</label>
+        <select id="fxParticles">
+          <option value="none">None</option>
+          <option value="snow">Snow</option>
+          <option value="bokeh">Bokeh lights</option>
+          <option value="sparkles">Sparkles</option>
+          <option value="confetti">Confetti</option>
+          <option value="rain">Rain</option>
+          <option value="dust">Floating dust</option>
+        </select>
         <label class="field-label">Film grain <span id="fxGrainLabel"></span></label>
         <input type="range" id="fxGrain" min="0" max="1" step="0.05" value="0">
         <div class="field-row">
