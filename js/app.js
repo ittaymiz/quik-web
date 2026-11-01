@@ -36,7 +36,7 @@ function toast(msg, ms = 2200) {
    State
    ====================================================================== */
 function newProject() {
-  return { title: '', aspect: '16:9', theme: 'classic', pace: 'medium', themeTitle: true, themeMusic: true, targetLength: 120, clips: [], music: null };
+  return { title: '', aspect: '16:9', theme: 'classic', pace: 'medium', themeTitle: true, themeMusic: true, targetLength: 30, clips: [], music: null };
 }
 function defaultClip(m) {
   return {
@@ -185,16 +185,57 @@ function thumbFrom(source, w, h, size = 200) {
   return c.toDataURL('image/jpeg', 0.7);
 }
 
-async function loadVideoMedia(entry) {
+/* ---------- Player pool ----------
+   Phones allow only a few hardware video decoders at once, so instead of one element per file the
+   whole timeline is played by two shared elements (one playing, one pre-loading the next clip) plus
+   one off-screen element for thumbnails and transition frames. Clip i always uses players[i % 2]. */
+function makeVideoEl(inStage) {
   const el = document.createElement('video');
+  el.preload = 'auto'; el.playsInline = true; el.muted = true;
+  el.setAttribute('muted', ''); el.setAttribute('playsinline', '');
+  if (inStage) { el.className = 'stage-el'; $('#stageMedia').appendChild(el); }
+  return el;
+}
+const players = [{ el: makeVideoEl(true), mediaId: null }, { el: makeVideoEl(true), mediaId: null }];
+const scratch = { el: makeVideoEl(false), mediaId: null };
+function playerForIdx(idx) { return players[Math.abs(idx) % 2]; }
+function waitMeta(el, ms = 8000) {
+  return new Promise(res => {
+    if (el.readyState >= 1) return res();
+    const t = setTimeout(res, ms);
+    el.addEventListener('loadedmetadata', () => { clearTimeout(t); res(); }, { once: true });
+    el.addEventListener('error', () => { clearTimeout(t); res(); }, { once: true });
+  });
+}
+function bindSync(p, m) {
+  if (p.mediaId === m.id) return false;
+  p.mediaId = m.id;
+  p.el.pause();
+  p.el.src = m.url;
+  try { p.el.load(); } catch (e) {}
+  return true;
+}
+async function bind(p, m) {
+  if (p.mediaId !== m.id) bindSync(p, m);
+  if (p.el.readyState < 1) await waitMeta(p.el);
+}
+function unbind(p) {
+  p.mediaId = null; p.el.pause();
+  p.el.removeAttribute('src');
+  try { p.el.load(); } catch (e) {}
+}
+function unbindMedia(id) { [...players, scratch].forEach(p => { if (p.mediaId === id) unbind(p); }); }
+
+async function loadVideoMedia(entry) {
+  bindSync(scratch, entry);
+  const el = scratch.el;
   // Starts muted: iOS only decodes a muted video before the user has tapped play.
   // unlockMedia() unmutes it inside the first play gesture.
-  el.preload = 'auto'; el.playsInline = true; el.muted = true; el.setAttribute('muted', ''); el.setAttribute('playsinline', ''); el.src = entry.url;
   await new Promise((res, rej) => {
+    if (el.readyState >= 1) return res();
     const timer = setTimeout(() => rej(new Error('timed out while reading the video')), 25000);
     el.addEventListener('loadedmetadata', () => { clearTimeout(timer); res(); }, { once: true });
     el.addEventListener('error', () => { clearTimeout(timer); rej(new Error('the browser cannot play this video format')); }, { once: true });
-    try { el.load(); } catch (e) {}
   });
   // WebM files recorded by MediaRecorder report an infinite duration until seeked to the end.
   if (!isFinite(el.duration)) {
@@ -205,20 +246,10 @@ async function loadVideoMedia(entry) {
     });
     await seekTo(el, 0);
   }
-  entry.el = el;
   entry.duration = isFinite(el.duration) ? el.duration : 10;
   entry.w = el.videoWidth || 1280; entry.h = el.videoHeight || 720;
-  // Second element of the same source used for thumbnails / transition snapshots
-  // so it never fights the preview element for the decoder position. It is muted,
-  // which also lets iOS decode frames before the user has tapped play.
-  const scratch = document.createElement('video');
-  scratch.preload = 'auto'; scratch.muted = true; scratch.playsInline = true; scratch.setAttribute('muted', ''); scratch.src = entry.url;
-  await new Promise(res => { scratch.addEventListener('loadedmetadata', res, { once: true }); scratch.addEventListener('error', res, { once: true }); setTimeout(res, 3000); });
-  entry.scratch = scratch;
-  el.className = 'stage-el'; $('#stageMedia').appendChild(el);
-  entry.thumb = await grabVideoThumb(scratch, Math.min(0.5, entry.duration / 2), entry.w, entry.h);
-  if (isBlack(entry.thumb)) entry.thumb = await grabVideoThumb(el, Math.min(0.5, entry.duration / 2), entry.w, entry.h);
-  connectAudioEl(el);
+  entry.thumb = await grabVideoThumb(el, Math.min(0.5, entry.duration / 2), entry.w, entry.h);
+  if (isBlack(entry.thumb)) entry.thumb = await grabVideoThumb(el, Math.min(1.5, entry.duration / 3), entry.w, entry.h);
 }
 
 async function loadImageMedia(entry) {
@@ -304,6 +335,7 @@ async function removeMedia(id) {
     if (!clipById(state.selectedId)) state.selectedId = null;
   }
   state.media.delete(id);
+  unbindMedia(id);
   if (m.el && m.el.parentElement) m.el.parentElement.removeChild(m.el);
   URL.revokeObjectURL(m.url);
   await DB.deleteFile(id);
@@ -316,7 +348,8 @@ async function buildStrip(m) {
   if (m.strip) return m.strip;
   if (m.kind === 'image') { m.strip = [m.thumb]; return m.strip; }
   const n = 8, out = [];
-  const el = m.scratch;
+  await bind(scratch, m);
+  const el = scratch.el;
   for (let i = 0; i < n; i++) out.push(await grabVideoThumb(el, (i + 0.5) / n * m.duration, m.w, m.h, 120));
   m.strip = out;
   return out;
@@ -338,8 +371,10 @@ function setElVolume(el, v) {
    Called from the play button: starts and immediately pauses every element once. */
 const unlockedEls = new WeakSet();
 function unlockMedia() {
-  const els = [musicEl];
-  state.media.forEach(m => { if (m.kind === 'video') els.push(m.el); });
+  // Make sure both players carry a source so the gesture unlocks them.
+  let firstVideo = null; state.media.forEach(m => { if (!firstVideo && m.kind === 'video') firstVideo = m; });
+  players.forEach(p => { if (!p.mediaId && firstVideo) bindSync(p, firstVideo); });
+  const els = [musicEl, players[0].el, players[1].el];
   els.forEach(el => {
     if (unlockedEls.has(el) || !el.src) return;
     unlockedEls.add(el);
@@ -348,8 +383,8 @@ function unlockMedia() {
     const savedGain = g ? g.gain.value : null, savedMuted = false;
     if (g) { g.gain.value = 0; el.muted = false; } else el.muted = true;
     const restore = () => {
-      const active = state.playing && activeIdx >= 0 && P().clips[activeIdx] ? state.media.get(P().clips[activeIdx].mediaId) : null;
-      const keep = (el === musicEl && state.playing && P().music) || (active && active.el === el);
+      const activeClip = state.playing && activeIdx >= 0 ? P().clips[activeIdx] : null;
+      const keep = (el === musicEl && state.playing && P().music) || (activeClip && activeClip.kind === 'video' && playerForIdx(activeIdx).el === el);
       if (!keep) { el.pause(); if (g) g.gain.value = savedGain; else el.muted = savedMuted; }
       else if (!g) el.muted = savedMuted;
     };
@@ -367,7 +402,7 @@ function ensureAudio() {
   masterGain = actx.createGain();
   masterGain.connect(actx.destination);
   recDest = actx.createMediaStreamDestination();
-  state.media.forEach(m => { if (m.kind === 'video') connectAudioEl(m.el); });
+  players.forEach(p => connectAudioEl(p.el));
   connectAudioEl(musicEl);
 }
 function connectAudioEl(el) {
@@ -562,7 +597,7 @@ async function renderClipLastFrame(clip) {
   if (!m) return null;
   const dur = clipDuration(clip);
   let el = m.el;
-  if (clip.kind === 'video') { el = m.scratch; await seekTo(el, clip.end - 0.03); }
+  if (clip.kind === 'video') { await bind(scratch, m); el = scratch.el; await seekTo(el, clip.end - 0.03); await waitFrame(el, 150); }
   const saved = snapshotCanvas();
   ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
   drawSource(clip, m, el, dur, dur);
@@ -618,7 +653,8 @@ function drawFrameNow(loc, srcEl = null) {
   const { clip, idx, lt, dur } = loc;
   const m = state.media.get(clip.mediaId);
   if (!m) return;
-  drawSource(clip, m, srcEl || m.el, lt, dur);
+  const el = srcEl || (clip.kind === 'video' ? playerForIdx(idx).el : m.el);
+  drawSource(clip, m, el, lt, dur);
   drawText(clip, lt, dur);
   drawTransition(clip, idx, lt);
 }
@@ -632,9 +668,12 @@ async function renderAt(t) {
   let srcEl = null;
   if (loc.clip.kind === 'video' && m) {
     const st = loc.clip.start + loc.lt * loc.clip.speed;
-    await seekTo(m.el, st); await waitFrame(m.el, 120);
+    const p = playerForIdx(loc.idx);
+    await bind(p, m);
     if (token !== renderToken) return;
-    if (m.el.readyState < 2 && m.scratch) { await seekTo(m.scratch, st); if (token !== renderToken) return; srcEl = m.scratch; }
+    await seekTo(p.el, st); await waitFrame(p.el, 120);
+    if (token !== renderToken) return;
+    if (p.el.readyState < 2) { await bind(scratch, m); await seekTo(scratch.el, st); await waitFrame(scratch.el, 120); if (token !== renderToken) return; srcEl = scratch.el; }
   }
   drawFrameNow(loc, srcEl);
 }
@@ -664,13 +703,13 @@ function showStage(on) {
   if (on) { sizeStage(); stage.hidden = false; canvas.style.visibility = 'hidden'; }
   else {
     stage.hidden = true; canvas.style.visibility = '';
+    players.forEach(p => { p.el.style.visibility = 'hidden'; });
     state.media.forEach(m => { if (m.el && m.el.style) m.el.style.visibility = 'hidden'; });
     stagePrev.style.display = 'none'; stageOverlay.style.background = 'transparent'; stageText.innerHTML = ''; stageTextEl = null; stageClip = null;
   }
 }
 /* Same geometry as drawSource(), expressed in percentages of the stage. */
-function placeStageEl(c, m, lt, dur) {
-  const el = m.el;
+function placeStageEl(c, m, lt, dur, el) {
   const sw = m.w, sh = m.h;
   let scale = c.fit === 'cover' ? Math.max(W / sw, H / sh) : Math.min(W / sw, H / sh);
   let z = c.zoom, drift = 0;
@@ -686,12 +725,14 @@ function stageSetup(loc) {
   const { clip, idx } = loc;
   const m = state.media.get(clip.mediaId);
   stageClip = clip;
-  state.media.forEach(x => { if (x.el && x.el !== (m && m.el) && x.el.style) x.el.style.visibility = 'hidden'; });
-  if (m && m.el.style) {
-    placeStageEl(clip, m, loc.lt, loc.dur);
+  const el = m ? (clip.kind === 'video' ? playerForIdx(idx).el : m.el) : null;
+  players.forEach(p => { if (p.el !== el) p.el.style.visibility = 'hidden'; });
+  state.media.forEach(x => { if (x.el && x.el !== el && x.el.style) x.el.style.visibility = 'hidden'; });
+  if (m && el && el.style) {
+    placeStageEl(clip, m, loc.lt, loc.dur, el);
     const f = filterCss(clip.filter);
-    m.el.style.filter = f === 'none' ? '' : f;
-    m.el.style.visibility = 'visible';
+    el.style.filter = f === 'none' ? '' : f;
+    el.style.visibility = 'visible';
   }
   const v = clip.filter.vignette;
   stageVignette.style.background = v > 0 ? `radial-gradient(ellipse at center, rgba(0,0,0,0) 45%, rgba(0,0,0,${0.85 * v}) 100%)` : 'transparent';
@@ -745,7 +786,7 @@ function stageSetup(loc) {
 function stageUpdate(loc) {
   const { clip, lt, dur } = loc;
   const m = state.media.get(clip.mediaId);
-  if (clip.kind === 'image' && clip.kenBurns && m) placeStageEl(clip, m, lt, dur);
+  if (clip.kind === 'image' && clip.kenBurns && m) placeStageEl(clip, m, lt, dur, m.el);
   if (stageTextEl) {
     const t = clip.text;
     const showDur = t.dur > 0 ? Math.max(0.5, dur * t.dur) : dur;
@@ -798,7 +839,8 @@ function snapshotClip(loc) {
   const x = c.getContext('2d');
   const saveW = W, saveH = H;
   W = c.width; H = c.height;
-  try { x.fillStyle = '#000'; x.fillRect(0, 0, W, H); drawSourceTo(x, loc.clip, m, m.el, loc.dur, loc.dur); drawTextTo(x, loc.clip, loc.dur, loc.dur); }
+  const el = loc.clip.kind === 'video' ? playerForIdx(loc.idx).el : m.el;
+  try { x.fillStyle = '#000'; x.fillRect(0, 0, W, H); drawSourceTo(x, loc.clip, m, el, loc.dur, loc.dur); drawTextTo(x, loc.clip, loc.dur, loc.dur); }
   finally { W = saveW; H = saveH; }
   return c;
 }
@@ -812,10 +854,12 @@ function prerollNext(loc) {
   const next = P().clips[loc.idx + 1];
   if (!next || next.kind !== 'video' || prerolled.has(next.id)) return;
   if (loc.dur - loc.lt > 1.2) return;
-  const nm = state.media.get(next.mediaId), cm = state.media.get(loc.clip.mediaId);
-  if (!nm || (cm && nm.el === cm.el)) return;   // same element still playing the current clip
+  const nm = state.media.get(next.mediaId);
+  if (!nm) return;
+  const p = playerForIdx(loc.idx + 1);   // the other player: free while the current clip plays
   prerolled.add(next.id);
-  try { nm.el.playbackRate = clamp(next.speed, 0.0625, 16); nm.el.currentTime = next.start; } catch (e) {}
+  bindSync(p, nm);
+  try { p.el.playbackRate = clamp(next.speed, 0.0625, 16); p.el.currentTime = next.start; } catch (e) {}
 }
 
 function effectiveClipVolume(c) {
@@ -823,10 +867,12 @@ function effectiveClipVolume(c) {
   const duck = mus && mus.duck ? 0.35 : 1;
   return clamp(c.volume * duck, 0, 1);
 }
-function startClipMedia(clip, lt) {
+function startClipMedia(clip, lt, idx) {
   const m = state.media.get(clip.mediaId);
   if (!m || clip.kind !== 'video') return;
-  const el = m.el;
+  const p = playerForIdx(idx);
+  bindSync(p, m);
+  const el = p.el;
   if (prerolled.has(clip.id) && Math.abs(el.currentTime - (clip.start + lt * clip.speed)) < 0.25) { el.playbackRate = clamp(clip.speed, 0.0625, 16); setElVolume(el, effectiveClipVolume(clip)); el.play().catch(() => {}); return; }
   el.playbackRate = clamp(clip.speed, 0.0625, 16);
   try { el.preservesPitch = true; } catch (e) {}
@@ -834,9 +880,8 @@ function startClipMedia(clip, lt) {
   el.currentTime = clip.start + lt * clip.speed;
   el.play().catch(() => {});
 }
-function stopClipMedia(clip) {
-  const m = state.media.get(clip.mediaId);
-  if (m && m.kind === 'video') m.el.pause();
+function stopClipMedia(clip, idx) {
+  if (clip.kind === 'video') playerForIdx(idx).el.pause();
 }
 function musicVolumeAt(t) {
   const mus = P().music;
@@ -890,9 +935,13 @@ function play() {
   if (!P().clips.length) { toast('Add some clips first'); return; }
   stopPreview();
   ensureAudio();
-  unlockMedia();
   const total = totalDuration();
   if (state.playhead >= total - 0.05) state.playhead = 0;
+  const loc0 = locate(state.playhead);
+  if (loc0) {
+    for (let k = 0; k < 2; k++) { const c = P().clips[loc0.idx + k]; const m = c && state.media.get(c.mediaId); if (c && c.kind === 'video' && m) bindSync(playerForIdx(loc0.idx + k), m); }
+  }
+  unlockMedia();
   state.playing = true;
   wallStart = performance.now(); tStart = state.playhead; activeIdx = -1; prerolled.clear();
   if (!state.exporting) showStage(true);
@@ -905,7 +954,7 @@ function pause() {
   if (!state.playing) return;
   state.playing = false;
   cancelAnimationFrame(rafId);
-  if (activeIdx >= 0 && P().clips[activeIdx]) stopClipMedia(P().clips[activeIdx]);
+  if (activeIdx >= 0 && P().clips[activeIdx]) stopClipMedia(P().clips[activeIdx], activeIdx);
   activeIdx = -1; prerolled.clear();
   stopMusicNode();
   musicEl.pause();
@@ -932,25 +981,25 @@ function tick() {
     if (activeIdx >= 0 && P().clips[activeIdx]) {
       const prevLoc = layout()[activeIdx];
       if (prevLoc) { const snap = state.exporting ? snapshotCanvas() : snapshotClip(prevLoc); if (snap) state.snapCache.set(P().clips[activeIdx].id, snap); }
-      stopClipMedia(P().clips[activeIdx]);
+      stopClipMedia(P().clips[activeIdx], activeIdx);
     }
     activeIdx = loc.idx;
-    startClipMedia(loc.clip, loc.lt);
+    startClipMedia(loc.clip, loc.lt, loc.idx);
     if (!state.exporting) stageSetup(loc);
     // Until the new clip has actually presented a frame, keep showing the last frame of the previous one.
-    const mm = state.media.get(loc.clip.mediaId);
-    if (loc.clip.kind === 'video' && mm && typeof mm.el.requestVideoFrameCallback === 'function') {
+    const pel = loc.clip.kind === 'video' ? playerForIdx(loc.idx).el : null;
+    if (pel && typeof pel.requestVideoFrameCallback === 'function') {
       holdFrame = loc.idx > 0 ? state.snapCache.get(P().clips[loc.idx - 1].id) || null : null;
       frameReady = false;
       const token = activeIdx;
-      waitFrame(mm.el, 350).then(() => { if (token === activeIdx) { frameReady = true; holdFrame = null; } });
+      waitFrame(pel, 350).then(() => { if (token === activeIdx) { frameReady = true; holdFrame = null; } });
     } else { frameReady = true; holdFrame = null; }
   } else if (loc.clip.kind === 'video') {
-    const m = state.media.get(loc.clip.mediaId);
-    if (m) {
+    const pel = playerForIdx(loc.idx).el;
+    if (pel.readyState >= 2) {
       const expected = loc.clip.start + loc.lt * loc.clip.speed;
-      if (Math.abs(m.el.currentTime - expected) > 0.3) m.el.currentTime = expected;
-      if (m.el.paused) m.el.play().catch(() => {});
+      if (Math.abs(pel.currentTime - expected) > 0.35) pel.currentTime = expected;
+      if (pel.paused) pel.play().catch(() => {});
     }
   }
   state.playhead = t;
@@ -1479,8 +1528,10 @@ async function renderFrameOffline(t, cs) {
   const m = state.media.get(loc.clip.mediaId);
   if (loc.clip.kind === 'video' && m) {
     const st = loc.clip.start + loc.lt * loc.clip.speed;
-    await seekTo(m.el, st);
-    await waitFrame(m.el, 200);
+    const p = playerForIdx(loc.idx);
+    await bind(p, m);
+    await seekTo(p.el, st);
+    await waitFrame(p.el, 200);
   }
   drawFrameNow(loc);
 }
@@ -2086,9 +2137,9 @@ function bindUI() {
     if (!confirm('Start a new project? Imported media and the current edit will be removed from this browser.')) return;
     pause();
     await DB.clear();
-    state.media.forEach(m => URL.revokeObjectURL(m.url));
+    [...players, scratch].forEach(unbind);
+    state.media.forEach(m => { if (m.el && m.el.parentElement) m.el.parentElement.removeChild(m.el); URL.revokeObjectURL(m.url); });
     state.media.clear();
-    $('#stageMedia').innerHTML = '';
     state.project = newProject(); state.selectedId = null; state.playhead = 0;
     state.undo = []; state.redo = []; state.snapCache.clear();
     musicEl.pause(); musicEl.removeAttribute('src');
@@ -2309,5 +2360,5 @@ window.addEventListener('error', (e) => { if (e && e.message) toast(`Error: ${e.
 window.addEventListener('unhandledrejection', (e) => { const r = e && e.reason; toast(`Error: ${r && r.message ? r.message : r}`, 6000); });
 
 /* Exposed for debugging / tests */
-window.QuikWeb = { HAS_WEBCODECS, startOfflineExport, planEdit, fitToLength, targetSeconds, state, importFiles, addToTimeline, autoCreate, applyTheme, beatSync, play, pause, setPlayhead, renderAt, totalDuration, layout, setMusic, splitAtPlayhead, startExport, pickMime, useLibraryTrack, loadLibrary };
+window.QuikWeb = { HAS_WEBCODECS, startOfflineExport, players, scratch, planEdit, fitToLength, targetSeconds, state, importFiles, addToTimeline, autoCreate, applyTheme, beatSync, play, pause, setPlayhead, renderAt, totalDuration, layout, setMusic, splitAtPlayhead, startExport, pickMime, useLibraryTrack, loadLibrary };
 })();

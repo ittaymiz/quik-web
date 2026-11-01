@@ -285,16 +285,16 @@
         </div>
         <p class="small-text muted">A theme sets the look, the transitions and the pace for the whole edit. Auto Create uses the selected theme.</p>
         <div class="theme-grid" id="themeGrid"></div>
-        <label class="field-label">Video length <span id="lengthLabel">2:00</span></label>
+        <label class="field-label">Video length <span id="lengthLabel">30s</span></label>
         <div class="seg" id="lengthSeg">
           <button data-len="15">15s</button>
-          <button data-len="30">30s</button>
+          <button data-len="30" class="active">30s</button>
           <button data-len="60">1:00</button>
-          <button data-len="120" class="active">2:00</button>
+          <button data-len="120">2:00</button>
           <button data-len="180">3:00</button>
           <button data-len="music" title="Same length as the music track">♫</button>
         </div>
-        <input type="range" id="lengthSlider" min="10" max="600" step="5" value="120">
+        <input type="range" id="lengthSlider" min="10" max="600" step="5" value="30">
         <div class="field-row">
           <button id="rearrangeBtn" class="small-btn wide">↻ Re-arrange to this length</button>
         </div>
