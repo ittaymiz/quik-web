@@ -532,13 +532,15 @@ function motionFor(c, idx, lt, dur, t) {
     else if (mode === 'zoomOut') scale *= 1 + 0.10 * amt * (1 - p);
     else if (mode === 'panLeft' || mode === 'panRight') { scale *= 1 + 0.08 * amt; shift += (mode === 'panLeft' ? -1 : 1) * 0.035 * amt * (2 * p - 1); }
   }
-  // Beat pulse: a quick 4% push on each beat
+  // Beat pulse: a gentle push on the beat (every other beat on fast songs), eased in and out
   if (f.pulse && P().music && P().music.beats && t !== undefined) {
     const mus = P().music; const span = Math.max(1, mus.duration - (mus.offset || 0));
     const tt = ((t % span) + span) % span + (mus.offset || 0);
+    const fast = (mus.bpm || 0) > 118;
     let dt = Infinity;
-    for (let i = mus.beats.length - 1; i >= 0; i--) { const d = tt - mus.beats[i]; if (d >= 0) { dt = d; break; } }
-    if (dt < 0.4) scale *= 1 + 0.045 * Math.exp(-dt / 0.10);
+    for (let i = mus.beats.length - 1; i >= 0; i--) { if (fast && (i % 2)) continue; const d = tt - mus.beats[i]; if (d >= 0) { dt = d; break; } }
+    const amp = 0.05 * clamp(f.pulseAmt === undefined ? 0.5 : f.pulseAmt, 0, 1);
+    if (dt < 0.5) { const env = dt < 0.06 ? dt / 0.06 : Math.exp(-(dt - 0.06) / 0.18); scale *= 1 + amp * env; }
   }
   // Push / whip transitions act on the incoming clip
   const tr = c.transition;
@@ -631,8 +633,9 @@ function drawOverlays(loc) {
   }
   if (f.grain > 0) {
     const n = getNoise();
-    cx.save(); cx.globalCompositeOperation = 'overlay'; cx.globalAlpha = clamp(f.grain, 0, 1) * 0.35;
-    const ox = -Math.floor(Math.random() * 128), oy = -Math.floor(Math.random() * 128);
+    cx.save(); cx.globalCompositeOperation = 'overlay'; cx.globalAlpha = clamp(f.grain, 0, 1) * 0.25;
+    const k = Math.floor(((loc && (loc.offset + loc.lt)) || 0) * 8);
+    const ox = -Math.floor(prand(k, 11) * 128), oy = -Math.floor(prand(k, 12) * 128);
     const sc = Math.max(1, Math.round(W / 960));   // keep grain size similar at any resolution
     for (let y = oy; y < H; y += 128 * sc) for (let x = ox; x < W; x += 128 * sc) cx.drawImage(n, x, y, 128 * sc, 128 * sc);
     cx.restore();
@@ -652,8 +655,9 @@ function stageOverlays(loc) {
   if (f.grain > 0) {
     if (!noiseUrl) getNoise();
     if (!stageGrain.style.backgroundImage) stageGrain.style.backgroundImage = `url(${noiseUrl})`;
-    stageGrain.style.opacity = String(clamp(f.grain, 0, 1) * 0.35);
-    stageGrain.style.backgroundPosition = `${Math.floor(Math.random() * 128)}px ${Math.floor(Math.random() * 128)}px`;
+    stageGrain.style.opacity = String(clamp(f.grain, 0, 1) * 0.25);
+    const k = Math.floor(((loc && (loc.offset + loc.lt)) || 0) * 8);
+    stageGrain.style.backgroundPosition = `${Math.floor(prand(k, 11) * 128)}px ${Math.floor(prand(k, 12) * 128)}px`;
   } else stageGrain.style.opacity = '0';
   stageBars.style.display = f.letterbox ? 'block' : 'none';
   stageParticlesUpdate(loc ? loc.offset + loc.lt : 0);
@@ -1006,8 +1010,8 @@ function drawTransition(c, idx, lt) {
       ctx.fillRect(0, 0, W, H);
       break;
     case 'flash':
-      if (prev && p < 0.5) { ctx.drawImage(prev, 0, 0); ctx.fillStyle = `rgba(255,255,255,${p * 2})`; }
-      else ctx.fillStyle = `rgba(255,255,255,${prev ? 1 - (p - 0.5) * 2 : 1 - p})`;
+      if (prev && p < 0.5) { ctx.drawImage(prev, 0, 0); ctx.fillStyle = `rgba(255,255,255,${0.75 * p * 2})`; }
+      else ctx.fillStyle = `rgba(255,255,255,${0.75 * (prev ? 1 - (p - 0.5) * 2 : 1 - p)})`;
       ctx.fillRect(0, 0, W, H);
       break;
     case 'slide':
@@ -1226,8 +1230,8 @@ function stageUpdate(loc) {
         else { if (hasPrev) stagePrev.style.opacity = '0'; stageOverlay.style.background = `rgba(0,0,0,${hasPrev ? 1 - (p - 0.5) * 2 : 1 - p})`; }
         break;
       case 'flash':
-        if (hasPrev && p < 0.5) { stagePrev.style.opacity = '1'; stageOverlay.style.background = `rgba(255,255,255,${p * 2})`; }
-        else { if (hasPrev) stagePrev.style.opacity = '0'; stageOverlay.style.background = `rgba(255,255,255,${hasPrev ? 1 - (p - 0.5) * 2 : 1 - p})`; }
+        if (hasPrev && p < 0.5) { stagePrev.style.opacity = '1'; stageOverlay.style.background = `rgba(255,255,255,${0.75 * p * 2})`; }
+        else { if (hasPrev) stagePrev.style.opacity = '0'; stageOverlay.style.background = `rgba(255,255,255,${0.75 * (hasPrev ? 1 - (p - 0.5) * 2 : 1 - p)})`; }
         break;
       case 'slide': case 'whip': if (hasPrev) stagePrev.style.transform = `translateX(${-easeInOut(p) * 100}%)`; break;
       case 'push': if (hasPrev) stagePrev.style.opacity = String(1 - easeInOut(p)); break;
@@ -1616,6 +1620,9 @@ async function ensureFaceApi() {
   try {
     if (!window.faceapi) await loadScriptOnce('js/vendor/faceapi/face-api.min.js');
     await window.faceapi.nets.tinyFaceDetector.loadFromUri('js/vendor/faceapi');
+    // Warm up once; if the GPU backend fails on this device, fall back to the CPU backend.
+    try { detectCtx.fillStyle = '#777'; detectCtx.fillRect(0, 0, 224, 126); await window.faceapi.detectAllFaces(detectCanvas, new window.faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.4 })); }
+    catch (e) { exportDiag.push(`face detector webgl failed (${e && e.message}); trying cpu`); await window.faceapi.tf.setBackend('cpu'); await window.faceapi.tf.ready(); }
     faceApiState = 'ready';
   } catch (e) { console.info('face detector unavailable', e && e.message); exportDiag.push(`face detector unavailable: ${e && e.message}`); faceApiState = 'failed'; }
   return faceApiState === 'ready';
@@ -1625,7 +1632,7 @@ async function peopleScore(source) {
   if (faceApiState !== 'ready') return 0;
   try {
     detectCtx.drawImage(source, 0, 0, 224, 126);
-    const faces = await window.faceapi.detectAllFaces(detectCanvas, new window.faceapi.TinyFaceDetectorOptions({ inputSize: 224, scoreThreshold: 0.45 }));
+    const faces = await window.faceapi.detectAllFaces(detectCanvas, new window.faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.4 }));
     if (!faces.length) return 0;
     let area = 0; faces.forEach(f => { area += (f.box.width * f.box.height) / (224 * 126); });
     return clamp(Math.sqrt(area) * 2.2 + 0.2 * Math.min(faces.length, 3), 0, 1);
@@ -1907,7 +1914,7 @@ function planEdit(target) {
   planEdit.lastDropped = uv.dropped + ui.dropped;
   if (!videos.length && !images.length) return [];
   // Clip count follows the pace (longer, fewer clips); the 2.5s minimum only bounds it.
-  const maxClips = clamp(Math.round(target / pace), 1, Math.max(1, Math.floor(target / AUTO_MIN_CLIP)));
+  const maxClips = clamp(Math.round(target / Math.max(pace, 3.0)), 1, Math.max(1, Math.floor(target / AUTO_MIN_CLIP)));
   // Photos take at most a third of the slots (all of them when there is no video).
   const imgSlots = videos.length ? Math.min(images.length, Math.floor(maxClips / 3)) : Math.min(images.length, maxClips);
   if (images.length > imgSlots) {
@@ -2044,7 +2051,7 @@ function randomizeEffects({ transitions = true } = {}) {
   const pool = th.transitions || [th.transition || 'crossfade'];
   const pace = PACE[P().pace] || PACE.medium;
   const pick = (arr, avoid) => { const opts = arr.filter(x => x !== avoid); return opts[Math.floor(Math.random() * opts.length)] || arr[0]; };
-  let prevMove = null, prevTr = null;
+  let prevMove = null, prevTr = null, lastFlash = -10;
   P().clips.forEach((c, i) => {
     if (c.kind === 'video') {
       c.motion = pick(['zoomIn', 'zoomOut', 'panLeft', 'panRight', 'zoomIn', 'zoomOut'], prevMove);   // zooms a bit more often
@@ -2053,7 +2060,9 @@ function randomizeEffects({ transitions = true } = {}) {
     }
     c.leak = Math.random() < 0.6;
     if (transitions) {
-      const type = i === 0 ? 'fade' : pick(pool, prevTr);
+      let type = i === 0 ? 'fade' : pick(pool, prevTr);
+      if (type === 'flash' && i - lastFlash < 3) type = pick(pool.filter(x => x !== 'flash'), prevTr) || 'crossfade';   // flashes at most every third cut
+      if (type === 'flash') lastFlash = i;
       prevTr = type;
       const base = type === 'flash' ? 0.3 : type === 'whip' ? 0.35 : pace < 3 ? 0.45 : 0.7;
       c.transition = { type, duration: Math.min(base * (0.8 + Math.random() * 0.5), Math.max(0.2, clipDuration(c) / 2)) };
@@ -2378,13 +2387,19 @@ async function decodeViaMediabunny(blob) {
     if (!(await track.canDecode())) { exportDiag.push(`mediabunny: ${track.codec || 'unknown'} track cannot be decoded here (AudioDecoder ${typeof AudioDecoder !== 'undefined' ? 'present' : 'missing'})`); return null; }
     const sink = new mb.AudioBufferSink(track);
     const parts = []; let end = 0, sr = 48000, ch = 2;
-    for await (const w of sink.buffers()) { parts.push(w); end = Math.max(end, w.timestamp + w.duration); sr = w.buffer.sampleRate; ch = w.buffer.numberOfChannels; }
+    for await (const w of sink.buffers()) { parts.push(w); end = Math.max(end, Math.max(0, w.timestamp) + w.duration); sr = w.buffer.sampleRate; ch = w.buffer.numberOfChannels; }
     if (!parts.length) return { none: true };
     const OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
     const out = new OAC(ch, 1, sr).createBuffer(ch, Math.ceil(end * sr) + 1, sr);
     for (const w of parts) {
-      const off = Math.round(w.timestamp * sr);
-      for (let c = 0; c < ch; c++) out.getChannelData(c).set(w.buffer.getChannelData(Math.min(c, w.buffer.numberOfChannels - 1)).subarray(0, Math.max(0, out.length - off)), off);
+      let off = Math.round(w.timestamp * sr), skip = 0;
+      if (off < 0) { skip = -off; off = 0; }                       // AAC priming samples carry negative timestamps
+      for (let c = 0; c < ch; c++) {
+        const src = w.buffer.getChannelData(Math.min(c, w.buffer.numberOfChannels - 1));
+        if (skip >= src.length) continue;
+        const take = Math.min(src.length - skip, Math.max(0, out.length - off));
+        if (take > 0) out.getChannelData(c).set(src.subarray(skip, skip + take), off);
+      }
     }
     return { buffer: out };
   } catch (e) { exportDiag.push(`mediabunny decode failed: ${e && e.message}`); return null; }
@@ -2938,7 +2953,7 @@ async function verifyExportAudio(blob) {
 function diagnosticsText() {
   const lines = [buildReport('')];
   lines.push('', '== Media bin ==');
-  state.media.forEach(m => lines.push(`${m.kind} ${m.name} ${m.kind === 'video' ? fmt(m.duration) : ''} ${m.w}x${m.h} ${(m.blob && m.blob.size / 1e6).toFixed(1)}MB analysed:${!!(m.scores && m.scores.sig)}`));
+  state.media.forEach(m => { const sc = m.scores || {}; const mx = (arr) => arr && arr.length ? Math.max(...arr).toFixed(2) : '-'; lines.push(`${m.kind} ${m.name} ${m.kind === 'video' ? fmt(m.duration) : ''} ${m.w}x${m.h} ${(m.blob && m.blob.size / 1e6).toFixed(1)}MB analysed:${!!sc.sig} faces:${sc.hasFaces === undefined ? '-' : sc.hasFaces} audio:${sc.hasAudio === undefined ? '-' : sc.hasAudio} maxPeople:${mx(sc.people)} maxAction:${mx(sc.action)}${m.hilights && m.hilights.length ? ' hilights:' + m.hilights.map(h => h.toFixed(1)).join(',') : ''}`); });
   const dups = findDuplicateMedia(); if (dups.length) lines.push(`duplicate groups: ${dups.map(g => `${g.keep.name} x${g.dupes.length + 1}`).join(', ')}`);
   lines.push('', `== Timeline (${P().clips.length} clips, ${fmt(totalDuration())}, target ${P().targetLength}, theme ${P().theme}, pace ${P().pace}) ==`);
   layout().forEach(({ clip, offset, dur }) => {
@@ -2951,7 +2966,7 @@ function diagnosticsText() {
     }
     lines.push(`${fmt(offset)} ${clip.kind} ${clip.name}${clip.kind === 'video' ? ` src ${clip.start.toFixed(2)}-${clip.end.toFixed(2)}` : ''} len ${dur.toFixed(2)}${why}`);
   });
-  lines.push(`face detector: ${faceApiState}; prefs ${JSON.stringify(prefs())}`);
+  lines.push(`face detector: ${faceApiState}${window.faceapi ? ' backend ' + window.faceapi.tf.getBackend() : ''}; prefs ${JSON.stringify(prefs())}; fx ${JSON.stringify(fx())}`);
   const byFile = {}; P().clips.forEach(c => { byFile[c.name] = (byFile[c.name] || 0) + 1; });
   lines.push('', 'clips per file: ' + Object.entries(byFile).map(([k, v]) => `${k}:${v}`).join(', '));
   return lines.join('\n');
@@ -3468,6 +3483,7 @@ function renderFxPanel() {
   $('#fxPulse').checked = !!f.pulse; $('#fxLetterbox').checked = !!f.letterbox; $('#fxLeaks').checked = !!f.leaks;
   $('#fxGrain').value = f.grain; $('#fxGrainLabel').textContent = f.grain ? `${Math.round(f.grain * 100)}%` : 'off';
   $('#fxParticles').value = f.particles || 'none';
+  const pa = f.pulseAmt === undefined ? 0.5 : f.pulseAmt; $('#fxPulseAmt').value = pa; $('#fxPulseAmtLabel').textContent = `${Math.round(pa * 100)}%`;
   $('#clipMotionRow').hidden = !(c && c.kind === 'video');
   $('#clipLeakRow').hidden = !c;
   if (c) { $('#clipMotion').value = c.motion || 'auto'; $('#clipLeak').checked = c.leak !== false; }
@@ -3751,6 +3767,7 @@ function bindUI() {
   $('#fxMotion').addEventListener('input', (e) => fxSet({ motion: Number(e.target.value) }));
   $('#fxGrain').addEventListener('input', (e) => fxSet({ grain: Number(e.target.value) }));
   $('#fxParticles').addEventListener('change', (e) => fxSet({ particles: e.target.value }));
+  $('#fxPulseAmt').addEventListener('input', (e) => fxSet({ pulseAmt: Number(e.target.value) }));
   $('#fxPulse').addEventListener('change', (e) => fxSet({ pulse: e.target.checked }));
   $('#fxLetterbox').addEventListener('change', (e) => fxSet({ letterbox: e.target.checked }));
   $('#fxLeaks').addEventListener('change', (e) => fxSet({ leaks: e.target.checked }));
@@ -3838,5 +3855,5 @@ window.addEventListener('error', (e) => { if (e && e.message) toast(`Error: ${e.
 window.addEventListener('unhandledrejection', (e) => { const r = e && e.reason; toast(`Error: ${r && r.message ? r.message : r}`, 6000); });
 
 /* Exposed for debugging / tests */
-window.QuikWeb = { addHiLight, drawParticles, PARTICLE_KINDS, addSticker, EMOJIS, segmentsOf, srcTimeAt, speedAt, setClipDurationTo, randomizeEffects, ensureFaceApi, peopleScore, faceApiState: () => faceApiState, findDuplicateMedia, removeDuplicateMedia, diagnosticsText, ensureAnalyzed, pickWindows, dedupeClips, uniqueMedia, sceneSimilarity, HAS_WEBCODECS, startOfflineExport, audioFallback, setExportMode: (m) => { exportMode = m; }, audioBufferCache, normalizeAacDescription, aacLcConfig, players, scratch, planEdit, fitToLength, targetSeconds, state, importFiles, addToTimeline, autoCreate, applyTheme, beatSync, play, pause, setPlayhead, renderAt, totalDuration, layout, setMusic, splitAtPlayhead, startExport, pickMime, useLibraryTrack, loadLibrary };
+window.QuikWeb = { getAudioBuffer, addHiLight, drawParticles, PARTICLE_KINDS, addSticker, EMOJIS, segmentsOf, srcTimeAt, speedAt, setClipDurationTo, randomizeEffects, ensureFaceApi, peopleScore, faceApiState: () => faceApiState, findDuplicateMedia, removeDuplicateMedia, diagnosticsText, ensureAnalyzed, pickWindows, dedupeClips, uniqueMedia, sceneSimilarity, HAS_WEBCODECS, startOfflineExport, audioFallback, setExportMode: (m) => { exportMode = m; }, audioBufferCache, normalizeAacDescription, aacLcConfig, players, scratch, planEdit, fitToLength, targetSeconds, state, importFiles, addToTimeline, autoCreate, applyTheme, beatSync, play, pause, setPlayhead, renderAt, totalDuration, layout, setMusic, splitAtPlayhead, startExport, pickMime, useLibraryTrack, loadLibrary };
 })();
