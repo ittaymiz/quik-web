@@ -849,6 +849,42 @@ function snapshotClip(loc) {
    Playback engine
    ====================================================================== */
 let wallStart = 0, tStart = 0, activeIdx = -1, rafId = 0, holdFrame = null, frameReady = true;
+/* Live render: the timeline plays through the stage (smooth on phones) while every presented
+   frame is composed on the canvas and encoded with its exact timestamp. */
+let liveExport = null;   // { venc, fps, total, lastT, lastKey, frames, resolve, reject, onProgress }
+function liveEncodeFrame(loc, t) {
+  const le = liveExport;
+  const el = loc.clip.kind === 'video' ? playerForIdx(loc.idx).el : null;
+  if (!frameReady && holdFrame) { ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.filter = 'none'; ctx.drawImage(holdFrame, 0, 0, W, H); }
+  else drawFrameNow(loc, el);
+  const key = el ? el.currentTime : t;
+  const inMotion = loc.clip.kind !== 'video' || loc.lt < (loc.clip.transition.duration || 0) + 0.1 || (loc.clip.text.content || '').trim();
+  if (t - le.lastT < 1 / le.fps * 0.7) return;
+  if (!inMotion && key === le.lastKey) return;      // no new video frame yet
+  try {
+    const frame = new VideoFrame(canvas, { timestamp: Math.round(t * 1e6), duration: Math.round(1e6 / le.fps) });
+    le.venc.encode(frame, { keyFrame: le.frames % (le.fps * 2) === 0 });
+    frame.close();
+    le.frames++; le.lastT = t; le.lastKey = key;
+  } catch (e) { le.error = e; }
+  if (le.onProgress && le.frames % 5 === 0) le.onProgress(t / le.total);
+}
+function renderLive(venc, fps, total, onProgress) {
+  return new Promise((resolve, reject) => {
+    liveExport = { venc, fps, total, lastT: -1, lastKey: null, frames: 0, resolve, reject, onProgress, error: null };
+    state.snapCache.clear();
+    if (masterGain) masterGain.gain.value = 0;
+    state.playhead = 0;
+    play();
+    if (!state.playing) { liveExport = null; reject(new Error('could not start playback for live render')); }
+  });
+}
+function endLive(err) {
+  const le = liveExport; if (!le) return;
+  liveExport = null;
+  if (masterGain) masterGain.gain.value = 1;
+  if (err) le.reject(err); else le.resolve(le.frames);
+}
 const prerolled = new Set();
 function prerollNext(loc) {
   const next = P().clips[loc.idx + 1];
@@ -974,13 +1010,15 @@ function tick() {
     pause();
     updatePlayheadUI();
     if (wasExporting) finishExport();
+    if (liveExport) endLive(liveExport.error);
     return;
   }
+  if (liveExport && ((offline && offline.cancelled) || liveExport.error)) { const e = liveExport.error || new Error('cancelled'); pause(); endLive(e); return; }
   const loc = locate(t);
   if (loc.idx !== activeIdx) {
     if (activeIdx >= 0 && P().clips[activeIdx]) {
       const prevLoc = layout()[activeIdx];
-      if (prevLoc) { const snap = state.exporting ? snapshotCanvas() : snapshotClip(prevLoc); if (snap) state.snapCache.set(P().clips[activeIdx].id, snap); }
+      if (prevLoc) { const snap = (state.exporting || liveExport) ? snapshotCanvas() : snapshotClip(prevLoc); if (snap) state.snapCache.set(P().clips[activeIdx].id, snap); }
       stopClipMedia(P().clips[activeIdx], activeIdx);
     }
     activeIdx = loc.idx;
@@ -1007,7 +1045,7 @@ function tick() {
   if (state.exporting) {
     if (!frameReady && holdFrame) { ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.filter = 'none'; ctx.drawImage(holdFrame, 0, 0); }
     else drawFrameNow(loc);
-  } else stageUpdate(loc);
+  } else { stageUpdate(loc); if (liveExport) liveEncodeFrame(loc, t); }
   if (P().music) {
     if (musicGain) musicGain.gain.value = musicVolumeAt(t);
     else { setElVolume(musicEl, musicVolumeAt(t)); if (musicEl.paused && musicEl.src && (P().music.loop || P().music.offset + t < P().music.duration)) musicEl.play().catch(() => {}); }
@@ -1752,8 +1790,9 @@ async function getFrameSource(m) {
       if (track && await track.canDecode()) {
         const scale = Math.min(1, Math.max(W, H) * 1.0 / Math.max(m.w, m.h));
         const sink = new mb.CanvasSink(track, { width: Math.max(2, Math.round(m.w * scale)), height: Math.max(2, Math.round(m.h * scale)), fit: 'fill', poolSize: 3 });
+        exportDiag.push(`frames: hardware decoder for ${m.name}`);
         src = {
-          input, sink, iter: null, cur: null, nxt: null, done: true, lastT: -1,
+          input, sink, iter: null, cur: null, nxt: null, done: true, lastT: -1, yielded: 0,
           async restart(st) {
             if (this.iter) { try { await this.iter.return(); } catch (e) {} }
             this.iter = this.sink.canvases(Math.max(0, st)); this.cur = null; this.nxt = null; this.done = false; this.lastT = st;
@@ -1765,7 +1804,7 @@ async function getFrameSource(m) {
               if (this.nxt) this.cur = this.nxt;
               const r = await this.iter.next();
               if (r.done) { this.done = true; this.nxt = null; break; }
-              this.nxt = r.value;
+              this.nxt = r.value; this.yielded++;
               if (!this.cur) this.cur = this.nxt;
             }
             return this.cur ? this.cur.canvas : null;
@@ -1836,6 +1875,7 @@ function setExportStatus(p, text) {
   $('#exportProgress').style.width = `${Math.round(p * 100)}%`;
   $('#exportStatus').textContent = text;
 }
+let exportMode = 'auto';   // 'auto' | 'offline' | 'live'
 const exportDiag = [];
 exportDiag.push = function (msg) { if (this.length < 12) Array.prototype.push.call(this, msg); console.info('[export]', msg); };
 const QUALITY = { share: { res: 1280, fps: 30, bitrate: 4e6, label: '720p' }, high: { res: 1920, fps: 30, bitrate: 10e6, label: '1080p' }, max: { res: 1920, fps: 60, bitrate: 14e6, label: '1080p60' } };
@@ -1903,21 +1943,66 @@ async function startOfflineExport(q) {
     const vchunks = [];
     venc = new VideoEncoder({ output: (c, m) => vchunks.push([c, m]), error: (e) => { err = e; } });
     venc.configure(vcodec.cfg);
-    const cs = { idx: -1, fresh: true };
     const t0 = performance.now();
-    for (let i = 0; i < frames; i++) {
-      if (offline.cancelled) throw new Error('cancelled');
-      if (err) throw err;
-      const t = Math.min(i / fps, Math.max(0, total - 0.0005));
-      await renderFrameOffline(t, cs);
-      const frame = new VideoFrame(canvas, { timestamp: Math.round(i * 1e6 / fps), duration: Math.round(1e6 / fps) });
-      venc.encode(frame, { keyFrame: i % (fps * 2) === 0 });
-      frame.close();
-      while (venc.encodeQueueSize > 4) await sleep(4);
-      if (i % 5 === 0) {
-        const el = (performance.now() - t0) / 1000, eta = el / (i + 1) * (frames - i - 1);
-        videoStatus = `Video ${Math.round((i + 1) / frames * 100)}% · ${fmt(t)} / ${fmt(total)} · ~${Math.ceil(eta)}s left`;
-        show(0.03 + 0.9 * i / frames);
+    // Which frame strategy? Hardware decoding when every video file supports it; otherwise, on phones,
+    // live render through the stage (the seek-the-player path returns stale frames on iOS).
+    let useLive = exportMode === 'live';
+    if (exportMode === 'auto') {
+      const vids = []; state.media.forEach(m => { if (m.kind === 'video' && P().clips.some(c => c.mediaId === m.id)) vids.push(m); });
+      let fastAll = true;
+      for (const m of vids) { if (!(await getFrameSource(m))) { fastAll = false; break; } }
+      if (!fastAll && IS_IOS) { useLive = true; exportDiag.push('live render: hardware decoding unavailable for some files'); }
+    }
+    const renderOffline = async () => {
+      const cs = { idx: -1, fresh: true };
+      let clipStartYield = 0, clipStartTime = 0, checked = false;
+      for (let i = 0; i < frames; i++) {
+        if (offline.cancelled) throw new Error('cancelled');
+        if (err) throw err;
+        const t = Math.min(i / fps, Math.max(0, total - 0.0005));
+        const before = cs.idx;
+        await renderFrameOffline(t, cs);
+        // Starvation check on the first full video clip: too few decoded frames → switch to live render.
+        if (exportMode === 'auto' && !checked && cs.idx !== before) {
+          const prev = P().clips[before];
+          const pm = prev && prev.kind === 'video' ? state.media.get(prev.mediaId) : null;
+          const fs = pm ? frameSources.get(pm.id) : null;
+          if (fs && before >= 0) {
+            const srcDur = (prev.end - prev.start), got = fs.yielded - clipStartYield;
+            if (srcDur > 1 && got < srcDur * 24 * 0.4) { exportDiag.push(`hardware decoder starved (${got} frames for ${srcDur.toFixed(1)}s) → live render`); throw new Error('switch-live'); }
+            checked = true;
+          }
+          const nm = cs.idx >= 0 && P().clips[cs.idx] && P().clips[cs.idx].kind === 'video' ? state.media.get(P().clips[cs.idx].mediaId) : null;
+          const nfs = nm ? frameSources.get(nm.id) : null;
+          clipStartYield = nfs ? nfs.yielded : 0; clipStartTime = t;
+        }
+        const frame = new VideoFrame(canvas, { timestamp: Math.round(i * 1e6 / fps), duration: Math.round(1e6 / fps) });
+        venc.encode(frame, { keyFrame: i % (fps * 2) === 0 });
+        frame.close();
+        while (venc.encodeQueueSize > 4) await sleep(4);
+        if (i % 5 === 0) {
+          const el = (performance.now() - t0) / 1000, eta = el / (i + 1) * (frames - i - 1);
+          videoStatus = `Video ${Math.round((i + 1) / frames * 100)}% · ${fmt(t)} / ${fmt(total)} · ~${Math.ceil(eta)}s left`;
+          show(0.03 + 0.9 * i / frames);
+        }
+      }
+    };
+    const renderLiveMode = async () => {
+      exportDiag.push('frames: live render through the player');
+      const n = await renderLive(venc, fps, total, (p) => { videoStatus = `Video ${Math.round(p * 100)}% (live render) · ${fmt(p * total)} / ${fmt(total)}`; show(0.03 + 0.9 * p); });
+      exportDiag.push(`live render produced ${n} frames`);
+    };
+    if (useLive) await renderLiveMode();
+    else {
+      try { await renderOffline(); }
+      catch (e) {
+        if (!(e && e.message === 'switch-live')) throw e;
+        // Restart the video with a fresh encoder in live mode; audio keeps running in parallel.
+        try { venc.close(); } catch (x) {}
+        vchunks.length = 0;
+        venc = new VideoEncoder({ output: (c, m) => vchunks.push([c, m]), error: (e2) => { err = e2; } });
+        venc.configure(vcodec.cfg);
+        await renderLiveMode();
       }
     }
     await venc.flush(); venc.close(); venc = null;
@@ -1973,6 +2058,8 @@ async function startOfflineExport(q) {
 }
 function finishOffline() {
   state.exportingOffline = false;
+  if (liveExport) { const le = liveExport; liveExport = null; if (masterGain) masterGain.gain.value = 1; try { le.reject(new Error('cancelled')); } catch (e) {} }
+  if (state.playing) pause();
   closeFrameSources();
   offline = null;
   keepAwake(false);
@@ -2102,6 +2189,7 @@ function unlockScratch() {
 async function startExport() {
   ensureAudio();          // must happen inside the tap on iOS, otherwise the audio graph stays suspended
   unlockScratch();
+  unlockMedia();          // players too, in case the user never pressed play (live render needs them)
   const q = $('#exportQuality').value || 'share';
   const { res, fps } = QUALITY[q] || QUALITY.share;
   if (state.exportingOffline || state.exporting) return;
@@ -2769,5 +2857,5 @@ window.addEventListener('error', (e) => { if (e && e.message) toast(`Error: ${e.
 window.addEventListener('unhandledrejection', (e) => { const r = e && e.reason; toast(`Error: ${r && r.message ? r.message : r}`, 6000); });
 
 /* Exposed for debugging / tests */
-window.QuikWeb = { HAS_WEBCODECS, startOfflineExport, audioFallback, audioBufferCache, normalizeAacDescription, aacLcConfig, players, scratch, planEdit, fitToLength, targetSeconds, state, importFiles, addToTimeline, autoCreate, applyTheme, beatSync, play, pause, setPlayhead, renderAt, totalDuration, layout, setMusic, splitAtPlayhead, startExport, pickMime, useLibraryTrack, loadLibrary };
+window.QuikWeb = { HAS_WEBCODECS, startOfflineExport, audioFallback, setExportMode: (m) => { exportMode = m; }, audioBufferCache, normalizeAacDescription, aacLcConfig, players, scratch, planEdit, fitToLength, targetSeconds, state, importFiles, addToTimeline, autoCreate, applyTheme, beatSync, play, pause, setPlayhead, renderAt, totalDuration, layout, setMusic, splitAtPlayhead, startExport, pickMime, useLibraryTrack, loadLibrary };
 })();
