@@ -1192,7 +1192,7 @@ function cellSignature() {
 }
 async function analyzeMedia(m) {
   if (m.kind !== 'video' || (m.scores && m.scores.sig && m.scores.sig.length === 144) || m.duration < 1) return;
-  const step = Math.max(1, m.duration / 60);
+  const step = Math.max(1, m.duration / 24);
   const values = [];
   const sig = [new Array(48).fill(0), new Array(48).fill(0), new Array(48).fill(0)], sigN = [0, 0, 0];   // first / middle / last third
   await withScratch(async () => {
@@ -1260,9 +1260,45 @@ function sceneSimilarity(a, b) {
 function sameContent(a, b) {
   if (a.kind !== b.kind) return false;
   if (a.name === b.name && a.blob && b.blob && a.blob.size === b.blob.size) return true;
+  if (a.name && a.name === b.name && a.w === b.w && a.h === b.h && (a.kind === 'image' || Math.abs(a.duration - b.duration) < 0.15)) return true;
   const sim = sceneSimilarity(a, b);
   if (a.kind === 'video') return Math.abs(a.duration - b.duration) < 0.1 && a.w === b.w && a.h === b.h && sim > 0.95;
   return sim > 0.93 && a.w === b.w && a.h === b.h;
+}
+/* Exact duplicates in the bin: same kind, name, dimensions and duration. Returns [{keep, dupes[]}]. */
+function findDuplicateMedia() {
+  const groups = new Map();
+  state.media.forEach(m => {
+    const key = `${m.kind}|${(m.name || '').toLowerCase()}|${m.w}x${m.h}|${m.kind === 'video' ? Math.round(m.duration * 10) : 0}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(m);
+  });
+  return Array.from(groups.values()).filter(g => g.length > 1).map(g => ({ keep: g[0], dupes: g.slice(1) }));
+}
+async function removeDuplicateMedia({ silent = false } = {}) {
+  const groups = findDuplicateMedia();
+  if (!groups.length) { if (!silent) toast('No duplicate files in the media bin'); return 0; }
+  if (!silent) pushUndo();
+  let n = 0;
+  for (const { keep, dupes } of groups) {
+    for (const d of dupes) {
+      P().clips.forEach(c => { if (c.mediaId === d.id) c.mediaId = keep.id; });
+      if (!keep.scores && d.scores) keep.scores = d.scores;
+      state.media.delete(d.id);
+      unbindMedia(d.id);
+      if (d.el && d.el.parentElement) d.el.parentElement.removeChild(d.el);
+      try { URL.revokeObjectURL(d.url); } catch (e) {}
+      DB.deleteFile(d.id);
+      n++;
+    }
+  }
+  // Clips that now point at the same file and footage are real repeats: keep the first of each.
+  const seen = new Set();
+  P().clips = P().clips.filter(c => { if (c.kind !== 'video') return true; const k = `${c.mediaId}|${c.start.toFixed(1)}`; if (seen.has(k)) return false; seen.add(k); return true; });
+  state.snapCache.clear();
+  renderAll(); save();
+  toast(`Removed ${n} duplicate file${n > 1 ? 's' : ''} from the media bin`, 4000);
+  return n;
 }
 /* Collapses files that are the same content or show the same scene into one representative each
    (first in bin order). strict: similarity above which two files count as the same scene. */
@@ -2328,6 +2364,26 @@ async function verifyExportAudio(blob) {
   } catch (e) { return { ok: null, text: `Audio check failed: ${e && e.message}` }; }
   finally { try { input && input.dispose && input.dispose(); } catch (e) {} }
 }
+function diagnosticsText() {
+  const lines = [buildReport('')];
+  lines.push('', '== Media bin ==');
+  state.media.forEach(m => lines.push(`${m.kind} ${m.name} ${m.kind === 'video' ? fmt(m.duration) : ''} ${m.w}x${m.h} ${(m.blob && m.blob.size / 1e6).toFixed(1)}MB analysed:${!!(m.scores && m.scores.sig)}`));
+  const dups = findDuplicateMedia(); if (dups.length) lines.push(`duplicate groups: ${dups.map(g => `${g.keep.name} x${g.dupes.length + 1}`).join(', ')}`);
+  lines.push('', `== Timeline (${P().clips.length} clips, ${fmt(totalDuration())}, target ${P().targetLength}, theme ${P().theme}, pace ${P().pace}) ==`);
+  layout().forEach(({ clip, offset, dur }) => lines.push(`${fmt(offset)} ${clip.kind} ${clip.name}${clip.kind === 'video' ? ` src ${clip.start.toFixed(2)}-${clip.end.toFixed(2)}` : ''} len ${dur.toFixed(2)} x${clip.speed} ${clip.filter.preset} ${clip.transition.type}`));
+  const byFile = {}; P().clips.forEach(c => { byFile[c.name] = (byFile[c.name] || 0) + 1; });
+  lines.push('', 'clips per file: ' + Object.entries(byFile).map(([k, v]) => `${k}:${v}`).join(', '));
+  return lines.join('\n');
+}
+async function shareDiagnostics() {
+  const txt = diagnosticsText();
+  const file = new File([txt], `quik-web-diagnostics-${Date.now()}.txt`, { type: 'text/plain' });
+  try {
+    if (navigator.canShare && navigator.canShare({ files: [file] })) { await navigator.share({ files: [file], title: 'Quik Web diagnostics' }); return; }
+  } catch (e) { if (e && e.name === 'AbortError') return; }
+  try { await navigator.clipboard.writeText(txt); toast('Diagnostics copied to the clipboard – paste them into the chat'); }
+  catch (e) { downloadBlob(new Blob([txt], { type: 'text/plain' }), file.name); }
+}
 function buildReport(extra) {
   const lines = [
     `Quik Web ${new Date().toISOString()}`,
@@ -2531,6 +2587,8 @@ function renderMediaGrid() {
     grid.appendChild(d);
   });
   $('#addAllBtn').disabled = !state.media.size;
+  const dups = findDuplicateMedia().reduce((a, g) => a + g.dupes.length, 0);
+  $('#dedupeBtn').hidden = !dups; if (dups) $('#dedupeBtn').textContent = `🧹 Remove ${dups} duplicate file${dups > 1 ? 's' : ''}`;
   $('#dropZone').style.display = state.media.size ? 'none' : '';
 }
 
@@ -2906,6 +2964,8 @@ function bindUI() {
   $('#dropZone').addEventListener('click', () => $('#fileInput').click());
   $('#fileInput').addEventListener('change', async (e) => { await importFiles(e.target.files); e.target.value = ''; });
   $('#addAllBtn').addEventListener('click', () => addToTimeline(Array.from(state.media.keys())));
+  $('#dedupeBtn').addEventListener('click', () => { pause(); removeDuplicateMedia(); });
+  $('#diagBtn').addEventListener('click', shareDiagnostics);
   $('#autoCreateBtn').addEventListener('click', async () => { pause(); autoCreate(); });
   ['#dropZone', '.preview-area', '.media-panel'].forEach(sel => {
     const el = $(sel);
@@ -3111,6 +3171,8 @@ async function boot() {
   renderAll();
   loadLibrary();
   if (state.media.size) toast('Welcome back – your project was restored');
+  if (findDuplicateMedia().length) await removeDuplicateMedia({ silent: true });
+  queueAnalysis(Array.from(state.media.values()));
 }
 boot();
 
@@ -3118,5 +3180,5 @@ window.addEventListener('error', (e) => { if (e && e.message) toast(`Error: ${e.
 window.addEventListener('unhandledrejection', (e) => { const r = e && e.reason; toast(`Error: ${r && r.message ? r.message : r}`, 6000); });
 
 /* Exposed for debugging / tests */
-window.QuikWeb = { ensureAnalyzed, pickWindows, dedupeClips, uniqueMedia, sceneSimilarity, HAS_WEBCODECS, startOfflineExport, audioFallback, setExportMode: (m) => { exportMode = m; }, audioBufferCache, normalizeAacDescription, aacLcConfig, players, scratch, planEdit, fitToLength, targetSeconds, state, importFiles, addToTimeline, autoCreate, applyTheme, beatSync, play, pause, setPlayhead, renderAt, totalDuration, layout, setMusic, splitAtPlayhead, startExport, pickMime, useLibraryTrack, loadLibrary };
+window.QuikWeb = { findDuplicateMedia, removeDuplicateMedia, diagnosticsText, ensureAnalyzed, pickWindows, dedupeClips, uniqueMedia, sceneSimilarity, HAS_WEBCODECS, startOfflineExport, audioFallback, setExportMode: (m) => { exportMode = m; }, audioBufferCache, normalizeAacDescription, aacLcConfig, players, scratch, planEdit, fitToLength, targetSeconds, state, importFiles, addToTimeline, autoCreate, applyTheme, beatSync, play, pause, setPlayhead, renderAt, totalDuration, layout, setMusic, splitAtPlayhead, startExport, pickMime, useLibraryTrack, loadLibrary };
 })();
