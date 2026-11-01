@@ -65,8 +65,11 @@
           <div id="stageMedia" class="stage-layer"></div>
           <canvas id="stagePrev" class="stage-prev" width="960" height="540"></canvas>
           <div id="stageVignette" class="stage-layer"></div>
+          <div id="stageLeak" class="stage-layer stage-leak"></div>
           <div id="stageText" class="stage-layer"></div>
           <div id="stageOverlay" class="stage-layer"></div>
+          <div id="stageGrain" class="stage-layer stage-grain"></div>
+          <div id="stageBars" class="stage-layer stage-bars"><div class="bar top"></div><div class="bar bottom"></div></div>
         </div>
         <div id="emptyHint" class="empty-hint">
           <div class="big">Quik Web</div>
@@ -92,6 +95,7 @@
         <button data-tab="clip" class="tab active">Clip</button>
         <button data-tab="style" class="tab">Style</button>
         <button data-tab="text" class="tab">Text</button>
+        <button data-tab="fx" class="tab">FX</button>
         <button data-tab="music" class="tab">Music</button>
         <button data-tab="theme" class="tab">Theme</button>
       </nav>
@@ -153,6 +157,8 @@
             <option value="slide">Slide</option>
             <option value="zoom">Zoom</option>
             <option value="wipe">Wipe</option>
+            <option value="push">Push in</option>
+            <option value="whip">Whip</option>
           </select>
           <label class="field-label">Transition length <span id="transitionDurLabel"></span></label>
           <input type="range" id="transitionDur" min="0.2" max="2" step="0.1" value="0.6">
@@ -239,6 +245,32 @@
           <label class="field-label">Show for <span id="textDurLabel"></span></label>
           <input type="range" id="textDur" min="0" max="1" step="0.05" value="1">
           <div class="small-text muted">0 = whole clip, otherwise share of the clip.</div>
+        </div>
+      </section>
+
+      <!-- FX tab -->
+      <section class="tab-page" data-page="fx">
+        <label class="field-label">Camera motion <span id="fxMotionLabel"></span></label>
+        <input type="range" id="fxMotion" min="0" max="1" step="0.05" value="0.6">
+        <div class="small-text muted">Slow zooms and pans on every clip. 0 turns it off.</div>
+        <div id="clipMotionRow">
+          <label class="field-label">This clip's move</label>
+          <select id="clipMotion">
+            <option value="auto">Auto (varies per clip)</option>
+            <option value="none">None</option>
+            <option value="zoomIn">Zoom in</option>
+            <option value="zoomOut">Zoom out</option>
+            <option value="panLeft">Pan left</option>
+            <option value="panRight">Pan right</option>
+          </select>
+        </div>
+        <label class="check"><input type="checkbox" id="fxPulse"> Pulse on the beat</label>
+        <label class="check"><input type="checkbox" id="fxLetterbox"> Cinematic letterbox bars</label>
+        <label class="check"><input type="checkbox" id="fxLeaks"> Light leaks at each cut</label>
+        <label class="field-label">Film grain <span id="fxGrainLabel"></span></label>
+        <input type="range" id="fxGrain" min="0" max="1" step="0.05" value="0">
+        <div class="field-row">
+          <button id="fxThemeBtn" class="small-btn wide">Reset to the theme's look</button>
         </div>
       </section>
 

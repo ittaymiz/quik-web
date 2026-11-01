@@ -20,6 +20,8 @@ const fmt = (s) => {
 const ASPECTS = { '16:9': [16, 9], '9:16': [9, 16], '1:1': [1, 1], '4:5': [4, 5] };
 const PREVIEW_LONG = window.matchMedia('(max-width: 760px)').matches ? 960 : 1280;
 const MIN_CLIP = 1.0;
+/* Effects on by default: camera motion, beat pulse, light leaks, a touch of grain. */
+const FX_DEFAULT = { motion: 0.6, pulse: true, letterbox: false, leaks: true, grain: 0.08 };
 const IS_IOS = /iP(hone|ad|od)/.test(navigator.platform) || (navigator.userAgent.includes('Mac') && 'ontouchend' in document);
 const HAS_CTX_FILTER = (() => { try { const c = document.createElement('canvas').getContext('2d'); return typeof c.filter === 'string'; } catch (e) { return false; } })();
 const phoneLayout = window.matchMedia('(max-width: 760px), (pointer: coarse) and (max-height: 500px)');
@@ -36,7 +38,7 @@ function toast(msg, ms = 2200) {
    State
    ====================================================================== */
 function newProject() {
-  return { title: '', aspect: '16:9', theme: 'classic', pace: 'medium', themeTitle: true, themeMusic: true, targetLength: 30, prefs: { people: true, views: true, action: true }, clips: [], music: null };
+  return { title: '', aspect: '16:9', theme: 'classic', pace: 'medium', themeTitle: true, themeMusic: true, targetLength: 30, prefs: { people: true, views: true, action: true }, fx: { ...FX_DEFAULT }, clips: [], music: null };
 }
 function defaultClip(m) {
   return {
@@ -46,7 +48,8 @@ function defaultClip(m) {
     fit: 'cover', zoom: 1, panX: 0, panY: 0,
     filter: { preset: 'none', brightness: 1, contrast: 1, saturation: 1, vignette: 0 },
     text: { content: '', pos: 'center', style: 'bold', size: 0.08, color: '#ffffff', accent: '#111111', anim: 'fade', dur: 0 },
-    transition: { type: 'none', duration: 0.6 }
+    transition: { type: 'none', duration: 0.6 },
+    motion: 'auto'
   };
 }
 
@@ -459,7 +462,89 @@ function filterCss(f) {
   return parts.join(' ') || 'none';
 }
 
-function drawSource(c, m, el, lt, dur) {
+/* ---------- Effects (shared by canvas renderer and stage) ---------- */
+function fx() { return { ...FX_DEFAULT, ...(P().fx || {}) }; }
+const MOTIONS = ['zoomIn', 'zoomOut', 'panRight', 'panLeft'];
+/* Geometry extras for a clip at local time lt: scale multiplier, horizontal shift (fraction of W). */
+function motionFor(c, idx, lt, dur, t) {
+  const f = fx();
+  let scale = 1, shift = 0;
+  const amt = clamp(f.motion || 0, 0, 1);
+  if (amt > 0 && c.kind === 'video') {
+    const mode = !c.motion || c.motion === 'auto' ? MOTIONS[Math.abs(idx) % MOTIONS.length] : c.motion;
+    const p = clamp(lt / Math.max(0.1, dur), 0, 1);
+    if (mode === 'zoomIn') scale *= 1 + 0.10 * amt * p;
+    else if (mode === 'zoomOut') scale *= 1 + 0.10 * amt * (1 - p);
+    else if (mode === 'panLeft' || mode === 'panRight') { scale *= 1 + 0.08 * amt; shift += (mode === 'panLeft' ? -1 : 1) * 0.035 * amt * (2 * p - 1); }
+  }
+  // Beat pulse: a quick 4% push on each beat
+  if (f.pulse && P().music && P().music.beats && t !== undefined) {
+    const mus = P().music; const span = Math.max(1, mus.duration - (mus.offset || 0));
+    const tt = ((t % span) + span) % span + (mus.offset || 0);
+    let dt = Infinity;
+    for (let i = mus.beats.length - 1; i >= 0; i--) { const d = tt - mus.beats[i]; if (d >= 0) { dt = d; break; } }
+    if (dt < 0.4) scale *= 1 + 0.045 * Math.exp(-dt / 0.10);
+  }
+  // Push / whip transitions act on the incoming clip
+  const tr = c.transition;
+  if (tr && lt < tr.duration) {
+    const p = clamp(lt / tr.duration, 0, 1);
+    if (tr.type === 'push') scale *= 1 + 0.12 * (1 - easeOut(p));
+    if (tr.type === 'whip' && idx > 0) shift += (1 - easeInOut(p));
+  }
+  return { scale, shift };
+}
+let noiseTile = null, noiseUrl = '';
+function getNoise() {
+  if (noiseTile) return noiseTile;
+  const c = document.createElement('canvas'); c.width = 128; c.height = 128;
+  const x = c.getContext('2d'); const img = x.createImageData(128, 128);
+  for (let i = 0; i < img.data.length; i += 4) { const v = 96 + Math.random() * 64; img.data[i] = img.data[i + 1] = img.data[i + 2] = v; img.data[i + 3] = 255; }
+  x.putImageData(img, 0, 0);
+  noiseTile = c; noiseUrl = c.toDataURL('image/png');
+  return c;
+}
+function leakAlpha(lt) { const f = fx(); if (!f.leaks) return 0; const p = lt / 1.2; return p >= 0 && p < 1 ? 0.5 * Math.sin(Math.PI * p) : 0; }
+/* Canvas overlays: light leak, grain, letterbox. */
+function drawOverlays(loc) {
+  const cx = ctxRef.ctx; const f = fx();
+  const la = loc ? leakAlpha(loc.lt) : 0;
+  if (la > 0) {
+    const p = loc.lt / 1.2;
+    const g = cx.createRadialGradient(W * (0.15 + 0.8 * p), H * 0.3, 0, W * (0.15 + 0.8 * p), H * 0.3, W * 0.7);
+    g.addColorStop(0, `rgba(255,190,90,${la})`); g.addColorStop(0.5, `rgba(255,120,60,${la * 0.5})`); g.addColorStop(1, 'rgba(255,80,40,0)');
+    cx.save(); cx.globalCompositeOperation = 'screen'; cx.fillStyle = g; cx.fillRect(0, 0, W, H); cx.restore();
+  }
+  if (f.grain > 0) {
+    const n = getNoise();
+    cx.save(); cx.globalCompositeOperation = 'overlay'; cx.globalAlpha = clamp(f.grain, 0, 1) * 0.35;
+    const ox = -Math.floor(Math.random() * 128), oy = -Math.floor(Math.random() * 128);
+    const sc = Math.max(1, Math.round(W / 960));   // keep grain size similar at any resolution
+    for (let y = oy; y < H; y += 128 * sc) for (let x = ox; x < W; x += 128 * sc) cx.drawImage(n, x, y, 128 * sc, 128 * sc);
+    cx.restore();
+  }
+  if (f.letterbox) { cx.save(); cx.fillStyle = '#000'; const bh = Math.round(H * 0.09); cx.fillRect(0, 0, W, bh); cx.fillRect(0, H - bh, W, bh); cx.restore(); }
+}
+/* Stage overlays (CSS twins of drawOverlays). */
+const stageLeak = $('#stageLeak'), stageGrain = $('#stageGrain'), stageBars = $('#stageBars');
+function stageOverlays(loc) {
+  const f = fx();
+  const la = loc ? leakAlpha(loc.lt) : 0;
+  if (la > 0) {
+    const p = loc.lt / 1.2;
+    stageLeak.style.background = `radial-gradient(circle at ${(15 + 80 * p).toFixed(1)}% 30%, rgba(255,190,90,1) 0%, rgba(255,120,60,0.5) 35%, rgba(255,80,40,0) 70%)`;
+    stageLeak.style.opacity = String(la);
+  } else stageLeak.style.opacity = '0';
+  if (f.grain > 0) {
+    if (!noiseUrl) getNoise();
+    if (!stageGrain.style.backgroundImage) stageGrain.style.backgroundImage = `url(${noiseUrl})`;
+    stageGrain.style.opacity = String(clamp(f.grain, 0, 1) * 0.35);
+    stageGrain.style.backgroundPosition = `${Math.floor(Math.random() * 128)}px ${Math.floor(Math.random() * 128)}px`;
+  } else stageGrain.style.opacity = '0';
+  stageBars.style.display = f.letterbox ? 'block' : 'none';
+}
+
+function drawSource(c, m, el, lt, dur, extra) {
   const cx = ctxRef.ctx;
   const sw = m.w, sh = m.h;
   let scale = c.fit === 'cover' ? Math.max(W / sw, H / sh) : Math.min(W / sw, H / sh);
@@ -469,9 +554,10 @@ function drawSource(c, m, el, lt, dur) {
     z *= 1 + 0.12 * p;
     drift = (p - 0.5) * 0.06 * W;
   }
-  scale *= z;
+  const mo = motionFor(c, extra ? extra.idx : 0, lt, dur, extra ? extra.t : undefined);
+  scale *= z * mo.scale;
   const dw = sw * scale, dh = sh * scale;
-  const dx = (W - dw) / 2 - c.panX * Math.abs(dw - W) / 2 + drift;
+  const dx = (W - dw) / 2 - c.panX * Math.abs(dw - W) / 2 + drift + mo.shift * W;
   const dy = (H - dh) / 2 - c.panY * Math.abs(dh - H) / 2;
   cx.save();
   const css = filterCss(c.filter);
@@ -637,6 +723,12 @@ function drawTransition(c, idx, lt) {
     case 'slide':
       if (prev) ctx.drawImage(prev, -easeInOut(p) * W, 0);
       break;
+    case 'whip':
+      if (prev) ctx.drawImage(prev, -easeInOut(p) * W, 0);
+      break;
+    case 'push':
+      if (prev) { ctx.globalAlpha = 1 - easeInOut(p); ctx.drawImage(prev, 0, 0); }
+      break;
     case 'wipe':
       if (prev) { const x = easeInOut(p) * W; ctx.beginPath(); ctx.rect(x, 0, W - x, H); ctx.clip(); ctx.drawImage(prev, 0, 0); }
       break;
@@ -661,9 +753,10 @@ function drawFrameNow(loc, srcEl = null) {
   const m = state.media.get(clip.mediaId);
   if (!m) return;
   const el = srcEl || (clip.kind === 'video' ? playerForIdx(idx).el : m.el);
-  drawSource(clip, m, el, lt, dur);
+  drawSource(clip, m, el, lt, dur, { idx, t: loc.offset + lt });
   drawText(clip, lt, dur);
   drawTransition(clip, idx, lt);
+  drawOverlays(loc);
 }
 
 let renderToken = 0;
@@ -713,17 +806,19 @@ function showStage(on) {
     players.forEach(p => { p.el.style.visibility = 'hidden'; });
     state.media.forEach(m => { if (m.el && m.el.style) m.el.style.visibility = 'hidden'; });
     stagePrev.style.display = 'none'; stageOverlay.style.background = 'transparent'; stageText.innerHTML = ''; stageTextEl = null; stageClip = null;
+    stageLeak.style.opacity = '0'; stageGrain.style.opacity = '0'; stageBars.style.display = 'none';
   }
 }
 /* Same geometry as drawSource(), expressed in percentages of the stage. */
-function placeStageEl(c, m, lt, dur, el) {
+function placeStageEl(c, m, lt, dur, el, idx = 0, t) {
   const sw = m.w, sh = m.h;
   let scale = c.fit === 'cover' ? Math.max(W / sw, H / sh) : Math.min(W / sw, H / sh);
   let z = c.zoom, drift = 0;
   if (c.kind === 'image' && c.kenBurns) { const p = clamp(lt / dur, 0, 1); z *= 1 + 0.12 * p; drift = (p - 0.5) * 0.06 * W; }
-  scale *= z;
+  const mo = motionFor(c, idx, lt, dur, t);
+  scale *= z * mo.scale;
   const dw = sw * scale, dh = sh * scale;
-  const dx = (W - dw) / 2 - c.panX * Math.abs(dw - W) / 2 + drift;
+  const dx = (W - dw) / 2 - c.panX * Math.abs(dw - W) / 2 + drift + mo.shift * W;
   const dy = (H - dh) / 2 - c.panY * Math.abs(dh - H) / 2;
   el.style.left = `${dx / W * 100}%`; el.style.top = `${dy / H * 100}%`;
   el.style.width = `${dw / W * 100}%`; el.style.height = `${dh / H * 100}%`;
@@ -736,7 +831,7 @@ function stageSetup(loc) {
   players.forEach(p => { if (p.el !== el) p.el.style.visibility = 'hidden'; });
   state.media.forEach(x => { if (x.el && x.el !== el && x.el.style) x.el.style.visibility = 'hidden'; });
   if (m && el && el.style) {
-    placeStageEl(clip, m, loc.lt, loc.dur, el);
+    placeStageEl(clip, m, loc.lt, loc.dur, el, idx, loc.offset + loc.lt);
     const f = filterCss(clip.filter);
     el.style.filter = f === 'none' ? '' : f;
     el.style.visibility = 'visible';
@@ -791,9 +886,11 @@ function stageSetup(loc) {
   stageOverlay.style.background = 'transparent';
 }
 function stageUpdate(loc) {
-  const { clip, lt, dur } = loc;
+  const { clip, lt, dur, idx } = loc;
   const m = state.media.get(clip.mediaId);
-  if (clip.kind === 'image' && clip.kenBurns && m) placeStageEl(clip, m, lt, dur, m.el);
+  const el = clip.kind === 'video' ? playerForIdx(idx).el : (m && m.el);
+  if (m && el) placeStageEl(clip, m, lt, dur, el, idx, loc.offset + lt);   // motion, pulse and push/whip move every frame
+  stageOverlays(loc);
   if (stageTextEl) {
     const t = clip.text;
     const showDur = t.dur > 0 ? Math.max(0.5, dur * t.dur) : dur;
@@ -828,7 +925,8 @@ function stageUpdate(loc) {
         if (hasPrev && p < 0.5) { stagePrev.style.opacity = '1'; stageOverlay.style.background = `rgba(255,255,255,${p * 2})`; }
         else { if (hasPrev) stagePrev.style.opacity = '0'; stageOverlay.style.background = `rgba(255,255,255,${hasPrev ? 1 - (p - 0.5) * 2 : 1 - p})`; }
         break;
-      case 'slide': if (hasPrev) stagePrev.style.transform = `translateX(${-easeInOut(p) * 100}%)`; break;
+      case 'slide': case 'whip': if (hasPrev) stagePrev.style.transform = `translateX(${-easeInOut(p) * 100}%)`; break;
+      case 'push': if (hasPrev) stagePrev.style.opacity = String(1 - easeInOut(p)); break;
       case 'wipe': if (hasPrev) stagePrev.style.clipPath = `inset(0 0 0 ${easeInOut(p) * 100}%)`; break;
       case 'zoom': if (hasPrev) { stagePrev.style.transform = `scale(${1 + easeOut(p) * 0.6})`; stagePrev.style.opacity = String(1 - p); } break;
     }
@@ -1616,6 +1714,7 @@ function fitToLength(target, { silent = false } = {}) {
 function applyTheme({ retrim = false } = {}) {
   const th = THEMES[P().theme] || THEMES.classic;
   const pace = PACE[P().pace] || PACE.medium;
+  P().fx = { ...FX_DEFAULT, ...(th.fx || {}) };
   P().clips.forEach((c, i) => {
     c.filter = { ...c.filter, preset: th.filter };
     c.transition = { type: i === 0 ? (th.transition === 'crossfade' || th.transition === 'slide' || th.transition === 'wipe' || th.transition === 'zoom' ? 'fade' : th.transition) : th.transition, duration: th.transition === 'flash' ? 0.3 : pace < 2 ? 0.4 : 0.7 };
@@ -2869,6 +2968,7 @@ function renderInspector() {
   $('#themeMusic').checked = P().themeMusic !== false;
   const pr = prefs(); $('#prefPeople').checked = pr.people; $('#prefViews').checked = pr.views; $('#prefAction').checked = pr.action;
   renderLengthControl();
+  renderFxPanel();
   renderMusicPanel();
   $('#projectTitle').value = P().title; $('#projectTitleMobile').value = P().title;
   if (!c || !m) return;
@@ -2967,6 +3067,14 @@ function renderLengthControl() {
   const sec = targetSeconds();
   $('#lengthSlider').value = clamp(sec, 10, 600);
   $('#lengthLabel').textContent = t === 'music' ? `♫ ${fmtLen(sec)}` : fmtLen(sec);
+}
+function renderFxPanel() {
+  const f = fx(); const c = selectedClip();
+  $('#fxMotion').value = f.motion; $('#fxMotionLabel').textContent = f.motion ? `${Math.round(f.motion * 100)}%` : 'off';
+  $('#fxPulse').checked = !!f.pulse; $('#fxLetterbox').checked = !!f.letterbox; $('#fxLeaks').checked = !!f.leaks;
+  $('#fxGrain').value = f.grain; $('#fxGrainLabel').textContent = f.grain ? `${Math.round(f.grain * 100)}%` : 'off';
+  $('#clipMotionRow').hidden = !(c && c.kind === 'video');
+  if (c) $('#clipMotion').value = c.motion || 'auto';
 }
 function renderMusicPanel() {
   const mus = P().music;
@@ -3212,6 +3320,16 @@ function bindUI() {
   [['#prefPeople', 'people'], ['#prefViews', 'views'], ['#prefAction', 'action']].forEach(([sel, key]) => $(sel).addEventListener('change', (e) => { P().prefs = { ...prefs(), [key]: e.target.checked }; save(); }));
   $('#applyThemeBtn').addEventListener('click', () => { if (!P().clips.length) { toast('Add clips first'); return; } pause(); pushUndo(); applyTheme({ retrim: false }); renderAll(); save(); toast(`${THEMES[P().theme].name} theme applied`); });
   $('#shuffleBtn').addEventListener('click', () => { pause(); shuffleClips(); });
+
+  // FX tab
+  const fxSet = (patch) => { P().fx = { ...fx(), ...patch }; state.snapCache.clear(); renderFxPanel(); renderAt(state.playhead); save(); };
+  $('#fxMotion').addEventListener('input', (e) => fxSet({ motion: Number(e.target.value) }));
+  $('#fxGrain').addEventListener('input', (e) => fxSet({ grain: Number(e.target.value) }));
+  $('#fxPulse').addEventListener('change', (e) => fxSet({ pulse: e.target.checked }));
+  $('#fxLetterbox').addEventListener('change', (e) => fxSet({ letterbox: e.target.checked }));
+  $('#fxLeaks').addEventListener('change', (e) => fxSet({ leaks: e.target.checked }));
+  $('#clipMotion').addEventListener('change', (e) => { const c = selectedClip(); if (!c) return; pushUndo(); c.motion = e.target.value; invalidate(c); renderAt(state.playhead); save(); });
+  $('#fxThemeBtn').addEventListener('click', () => { const th = THEMES[P().theme] || THEMES.classic; fxSet({ ...FX_DEFAULT, ...(th.fx || {}) }); toast(`${th.name} look restored`); });
 
   // Timeline zoom
   $('#tlZoom').addEventListener('input', (e) => { state.tlZoom = Number(e.target.value); renderTimeline(); });

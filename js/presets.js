@@ -14,15 +14,16 @@ const FILTERS = {
   golden:   { name: 'Golden',   css: 'sepia(0.45) saturate(1.5) brightness(1.05)' }
 };
 
+/* Each theme also carries an `fx` preset: camera motion amount, beat pulse, letterbox, light leaks, grain. */
 const THEMES = {
-  classic: { name: 'Classic',  desc: 'Clean crossfades, true colors', filter: 'none',     transition: 'crossfade', pace: 'medium', textStyle: 'bold',    swatch: 'linear-gradient(135deg,#4f8cff,#7c5cff)' },
-  action:  { name: 'Action',   desc: 'Punchy, fast cuts, flashes',   filter: 'vivid',    transition: 'flash',     pace: 'fast',   textStyle: 'outline', swatch: 'linear-gradient(135deg,#ff6b35,#ffb52e)' },
-  chill:   { name: 'Chill',    desc: 'Warm tones, slow fades',       filter: 'warm',     transition: 'fade',      pace: 'slow',   textStyle: 'minimal', swatch: 'linear-gradient(135deg,#f6d365,#fda085)' },
-  noir:    { name: 'Noir',     desc: 'Black & white, moody',         filter: 'bw',       transition: 'fade',      pace: 'medium', textStyle: 'box',     swatch: 'linear-gradient(135deg,#222,#999)' },
-  retro:   { name: 'Retro',    desc: 'Faded film look, zooms',       filter: 'vintage',  transition: 'zoom',      pace: 'medium', textStyle: 'box',     swatch: 'linear-gradient(135deg,#c79081,#dfa579)' },
-  epic:    { name: 'Epic',     desc: 'Cinematic contrast',           filter: 'dramatic', transition: 'zoom',      pace: 'medium', textStyle: 'outline', swatch: 'linear-gradient(135deg,#0f2027,#2c5364)' },
-  dreamy:  { name: 'Dreamy',   desc: 'Soft, airy, pastel',           filter: 'pastel',   transition: 'crossfade', pace: 'slow',   textStyle: 'minimal', swatch: 'linear-gradient(135deg,#a18cd1,#fbc2eb)' },
-  travel:  { name: 'Travel',   desc: 'Golden hour, slides',          filter: 'golden',   transition: 'slide',     pace: 'medium', textStyle: 'lower',   swatch: 'linear-gradient(135deg,#f7971e,#ffd200)' }
+  classic: { name: 'Classic',  desc: 'Clean crossfades, true colors', filter: 'none',     transition: 'crossfade', pace: 'medium', textStyle: 'bold', fx: { motion: 0.6, pulse: true, letterbox: false, leaks: true, grain: 0.08 },  swatch: 'linear-gradient(135deg,#4f8cff,#7c5cff)' },
+  action:  { name: 'Action',   desc: 'Punchy, fast cuts, flashes',   filter: 'vivid',    transition: 'flash',     pace: 'fast',   textStyle: 'outline', fx: { motion: 0.7, pulse: true, letterbox: false, leaks: false, grain: 0.1 }, swatch: 'linear-gradient(135deg,#ff6b35,#ffb52e)' },
+  chill:   { name: 'Chill',    desc: 'Warm tones, slow fades',       filter: 'warm',     transition: 'fade',      pace: 'slow',   textStyle: 'minimal', fx: { motion: 0.4, pulse: false, letterbox: false, leaks: true, grain: 0.15 }, swatch: 'linear-gradient(135deg,#f6d365,#fda085)' },
+  noir:    { name: 'Noir',     desc: 'Black & white, moody',         filter: 'bw',       transition: 'fade',      pace: 'medium', textStyle: 'box', fx: { motion: 0.4, pulse: false, letterbox: true, leaks: false, grain: 0.35 },     swatch: 'linear-gradient(135deg,#222,#999)' },
+  retro:   { name: 'Retro',    desc: 'Faded film look, zooms',       filter: 'vintage',  transition: 'zoom',      pace: 'medium', textStyle: 'box', fx: { motion: 0.5, pulse: false, letterbox: false, leaks: true, grain: 0.3 },     swatch: 'linear-gradient(135deg,#c79081,#dfa579)' },
+  epic:    { name: 'Epic',     desc: 'Cinematic contrast',           filter: 'dramatic', transition: 'zoom',      pace: 'medium', textStyle: 'outline', fx: { motion: 0.6, pulse: true, letterbox: true, leaks: false, grain: 0.12 }, swatch: 'linear-gradient(135deg,#0f2027,#2c5364)' },
+  dreamy:  { name: 'Dreamy',   desc: 'Soft, airy, pastel',           filter: 'pastel',   transition: 'crossfade', pace: 'slow',   textStyle: 'minimal', fx: { motion: 0.4, pulse: false, letterbox: false, leaks: true, grain: 0.1 }, swatch: 'linear-gradient(135deg,#a18cd1,#fbc2eb)' },
+  travel:  { name: 'Travel',   desc: 'Golden hour, slides',          filter: 'golden',   transition: 'slide',     pace: 'medium', textStyle: 'lower', fx: { motion: 0.6, pulse: false, letterbox: false, leaks: true, grain: 0.05 },   swatch: 'linear-gradient(135deg,#f7971e,#ffd200)' }
 };
 
 /* Target seconds per clip for each pace. */
