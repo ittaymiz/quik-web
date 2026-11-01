@@ -136,7 +136,7 @@ function save() {
   clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
     DB.putKV('project', JSON.parse(JSON.stringify(P())));
-    DB.putKV('media', Array.from(state.media.values()).map(m => ({ id: m.id, kind: m.kind, name: m.name })));
+    DB.putKV('media', Array.from(state.media.values()).map(m => ({ id: m.id, kind: m.kind, name: m.name, scores: m.scores || null })));
   }, 300);
 }
 
@@ -320,6 +320,7 @@ async function importFiles(files) {
   }
   renderMediaGrid();
   save();
+  queueAnalysis(added);
   if (failed.length) toast(`Could not open ${failed.length} file${failed.length > 1 ? 's' : ''} – ${failed[0]}`, 7000);
   else if (added.length) toast(`Added ${added.length} file${added.length > 1 ? 's' : ''} to the media bin`);
   return added;
@@ -348,9 +349,11 @@ async function buildStrip(m) {
   if (m.strip) return m.strip;
   if (m.kind === 'image') { m.strip = [m.thumb]; return m.strip; }
   const n = 8, out = [];
-  await bind(scratch, m);
-  const el = scratch.el;
-  for (let i = 0; i < n; i++) out.push(await grabVideoThumb(el, (i + 0.5) / n * m.duration, m.w, m.h, 120));
+  await withScratch(async () => {
+    await bind(scratch, m);
+    const el = scratch.el;
+    for (let i = 0; i < n; i++) out.push(await grabVideoThumb(el, (i + 0.5) / n * m.duration, m.w, m.h, 120));
+  });
   m.strip = out;
   return out;
 }
@@ -597,7 +600,7 @@ async function renderClipLastFrame(clip) {
   if (!m) return null;
   const dur = clipDuration(clip);
   let el = m.el;
-  if (clip.kind === 'video') { await bind(scratch, m); el = scratch.el; await seekTo(el, clip.end - 0.03); await waitFrame(el, 150); }
+  if (clip.kind === 'video') { await withScratch(async () => { await bind(scratch, m); await seekTo(scratch.el, clip.end - 0.03); await waitFrame(scratch.el, 150); }); el = scratch.el; }
   const saved = snapshotCanvas();
   ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
   drawSource(clip, m, el, dur, dur);
@@ -1142,6 +1145,140 @@ function targetSeconds() {
   return clamp(Number(t) || 120, 5, 3600);
 }
 function fmtLen(sec) { const m = Math.floor(sec / 60), r = Math.round(sec % 60); return m ? `${m}:${String(r).padStart(2, '0')}` : `${r}s`; }
+/* ---------- Highlight analysis ----------
+   Samples each video about once a second (scratch element), measures contrast, sharpness, motion and
+   exposure on a tiny frame, and stores a 0..1 "interest" curve. Auto Create picks the best windows. */
+let scratchLock = Promise.resolve();
+function withScratch(fn) { const run = scratchLock.then(fn, fn); scratchLock = run.catch(() => {}); return run; }
+const analysisQueue = [];
+let analysisRunning = false, analysisProgress = { done: 0, total: 0 };
+const probeCanvas = document.createElement('canvas'); probeCanvas.width = 64; probeCanvas.height = 36;
+const probeCtx = probeCanvas.getContext('2d', { willReadFrequently: true });
+
+function frameFeatures(prevL) {
+  const d = probeCtx.getImageData(0, 0, 64, 36).data;
+  const L = new Float32Array(64 * 36);
+  let mean = 0;
+  for (let i = 0, j = 0; i < d.length; i += 4, j++) { const l = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]; L[j] = l; mean += l; }
+  mean /= L.length;
+  let varSum = 0, sharp = 0, motion = 0;
+  for (let y = 0; y < 36; y++) for (let x = 0; x < 64; x++) {
+    const i = y * 64 + x, l = L[i];
+    varSum += (l - mean) * (l - mean);
+    if (x < 63) sharp += Math.abs(L[i + 1] - l);
+    if (prevL) motion += Math.abs(prevL[i] - l);
+  }
+  const std = Math.sqrt(varSum / L.length);
+  sharp /= (36 * 63); motion = prevL ? motion / L.length : 0;
+  let score = 0.35 * Math.min(1, std / 60) + 0.35 * Math.min(1, sharp / 18) + 0.3 * Math.min(1, motion / 22);
+  if (mean < 28) score *= 0.45; else if (mean < 50) score *= 0.8;
+  if (mean > 235) score *= 0.6;
+  if (motion > 60) score *= 0.7;            // violent shake / whip pans
+  return { score, L };
+}
+async function analyzeMedia(m) {
+  if (m.kind !== 'video' || m.scores || m.duration < 1) return;
+  const step = Math.max(1, m.duration / 60);
+  const values = [];
+  await withScratch(async () => {
+    await bind(scratch, m);
+    const el = scratch.el;
+    let prevL = null;
+    for (let t = step / 2; t < m.duration; t += step) {
+      await seekTo(el, t); await waitFrame(el, 150);
+      try { probeCtx.drawImage(el, 0, 0, 64, 36); } catch (e) { values.push(0.5); continue; }
+      const f = frameFeatures(prevL);
+      values.push(f.score); prevL = f.L;
+    }
+  });
+  if (!values.length) return;
+  // Smooth a little and normalise within the file
+  const sm = values.map((v, i) => (values[i - 1] ?? v) * 0.25 + v * 0.5 + (values[i + 1] ?? v) * 0.25);
+  const lo = Math.min(...sm), hi = Math.max(...sm);
+  m.scores = { step, values: hi - lo > 1e-3 ? sm.map(v => (v - lo) / (hi - lo)) : sm.map(() => 0.5) };
+  save();
+}
+function queueAnalysis(list) {
+  list.forEach(m => { if (m.kind === 'video' && !m.scores && !analysisQueue.includes(m)) analysisQueue.push(m); });
+  analysisProgress.total += list.filter(m => m.kind === 'video' && !m.scores).length;
+  runAnalysis();
+}
+async function runAnalysis() {
+  if (analysisRunning) return;
+  analysisRunning = true;
+  while (analysisQueue.length) {
+    const m = analysisQueue.shift();
+    if (!state.media.has(m.id)) continue;
+    try { await analyzeMedia(m); } catch (e) { console.info('analysis failed', m.name, e); }
+    analysisProgress.done++;
+  }
+  analysisRunning = false;
+  analysisProgress = { done: 0, total: 0 };
+}
+/* Waits (with a progress toast) until every video in the bin has an interest curve. */
+async function ensureAnalyzed(maxWaitMs = 120000) {
+  const pending = () => Array.from(state.media.values()).filter(m => m.kind === 'video' && !m.scores);
+  if (!pending().length) return true;
+  queueAnalysis(pending());
+  const t0 = performance.now();
+  while (pending().length && performance.now() - t0 < maxWaitMs) {
+    toast(`Finding the best moments… ${analysisProgress.done}/${analysisProgress.total}`, 4000);
+    await sleep(400);
+  }
+  return !pending().length;
+}
+/* Average interest of the window [s, s+len] of a video (0.5 when unknown). */
+function windowScore(m, s, len) {
+  const sc = m.scores; if (!sc) return 0.5;
+  let sum = 0, n = 0;
+  for (let i = 0; i < sc.values.length; i++) { const t = (i + 0.5) * sc.step; if (t >= s - 0.25 && t <= s + len + 0.25) { sum += sc.values[i]; n++; } }
+  return n ? sum / n : 0.5;
+}
+/* Picks k non-overlapping windows of length len in a video, best interest first, spread out. */
+function pickWindows(m, k, len) {
+  const dur = m.duration;
+  if (len >= dur - 0.05) return [[0, dur]];
+  const margin = Math.min(dur * 0.04, 0.75);
+  const cands = [];
+  for (let s = margin; s + len <= dur - margin + 1e-6; s += 0.25) cands.push({ s, base: windowScore(m, s, len) });
+  if (!cands.length) cands.push({ s: 0, base: 0.5 });
+  const chosen = [];
+  for (let i = 0; i < k; i++) {
+    let best = null, bestV = -1;
+    for (const c of cands) {
+      if (chosen.some(w => c.s < w[1] + 0.5 && c.s + len > w[0] - 0.5)) continue;   // never the same footage twice
+      // prefer moments far from already chosen ones, and (slightly) not the very start
+      let v = c.base;
+      chosen.forEach(w => { const dist = Math.abs(c.s - w[0]); v *= Math.min(1, 0.55 + dist / Math.max(1, dur) ); });
+      if (c.s < 0.5) v *= 0.9;
+      if (v > bestV) { bestV = v; best = c; }
+    }
+    if (!best) break;
+    chosen.push([best.s, best.s + len]);
+  }
+  chosen.sort((a, b) => a[0] - b[0]);
+  return chosen;
+}
+/* Final safety net: no two clips from the same file may share footage. */
+function dedupeClips(clips) {
+  const byMedia = new Map();
+  clips.forEach(c => { if (c.kind === 'video') { if (!byMedia.has(c.mediaId)) byMedia.set(c.mediaId, []); byMedia.get(c.mediaId).push(c); } });
+  const drop = new Set();
+  byMedia.forEach(list => {
+    list.sort((a, b) => a.start - b.start);
+    for (let i = 1; i < list.length; i++) {
+      const prev = list[i - 1], c = list[i];
+      if (c.start < prev.end - 0.05) {
+        const m = state.media.get(c.mediaId);
+        const len = c.end - c.start;
+        if (m && prev.end + 0.25 + len <= m.duration) { c.start = prev.end + 0.25; c.end = c.start + len; }
+        else drop.add(c.id);
+      }
+    }
+  });
+  return clips.filter(c => !drop.has(c.id));
+}
+
 /* Picks n items spread evenly across a list (keeps order). */
 function pickEvenly(arr, n) {
   if (n >= arr.length) return arr.slice();
@@ -1158,7 +1295,8 @@ function planEdit(target) {
   let videos = [], images = [];
   state.media.forEach(m => (m.kind === 'video' ? videos : images).push(m));
   if (!videos.length && !images.length) return [];
-  const maxClips = Math.max(1, Math.floor(target / AUTO_MIN_CLIP));
+  // Clip count follows the pace (longer, fewer clips); the 2.5s minimum only bounds it.
+  const maxClips = clamp(Math.round(target / pace), 1, Math.max(1, Math.floor(target / AUTO_MIN_CLIP)));
   // Photos take at most a third of the slots (all of them when there is no video).
   const imgSlots = videos.length ? Math.min(images.length, Math.floor(maxClips / 3)) : Math.min(images.length, maxClips);
   images = pickEvenly(images, imgSlots);
@@ -1166,7 +1304,14 @@ function planEdit(target) {
   if (images.length && images.length * imgDur > target * 0.4) imgDur = Math.max(2, target * 0.4 / images.length);
   const videoBudget = Math.max(0, target - images.length * imgDur);
   const videoSlots = Math.max(0, maxClips - images.length);
-  if (videos.length > videoSlots) videos = pickEvenly(videos, videoSlots);
+  if (videos.length > videoSlots) {
+    // More files than slots: keep the files whose best moment scores highest, in original order.
+    const probeLen = Math.max(AUTO_MIN_CLIP, Math.min(pace, 6));
+    const ranked = videos.map((m, i) => ({ m, i, v: m.scores ? Math.max(...pickWindows(m, 1, Math.min(probeLen, m.duration)).map(w => windowScore(m, w[0], w[1] - w[0]))) : 0.5 + (i % 2) * 0.01 }));
+    const anyScores = videos.some(m => m.scores);
+    const keep = anyScores ? ranked.sort((a, b) => b.v - a.v).slice(0, videoSlots).sort((a, b) => a.i - b.i).map(r => r.m) : pickEvenly(videos, videoSlots);
+    videos = keep;
+  }
   const totalSrc = videos.reduce((a, m) => a + m.duration, 0);
   const videoClips = [];
   if (videos.length && videoSlots > 0) {
@@ -1192,23 +1337,19 @@ function planEdit(target) {
       videos.forEach((m, i) => {
         const k = ks[i];
         const share = videoBudget * k / totalK;
-        const segLen = clamp(share / k, Math.min(AUTO_MIN_CLIP, m.duration), m.duration);
-        const margin = Math.min(m.duration * 0.05, 1);
-        const usable = Math.max(segLen, m.duration - 2 * margin);
-        for (let j = 0; j < k; j++) {
-          const center = margin + usable * (j + 0.5) / k;
-          const c = defaultClip(m);
-          c.start = clamp(center - segLen / 2, 0, Math.max(0, m.duration - segLen));
-          c.end = Math.min(m.duration, c.start + segLen);
-          videoClips.push(c);
-        }
+        // Windows must fit side by side without overlap; shorten them if the file is too short for k of them.
+        let segLen = clamp(share / k, Math.min(AUTO_MIN_CLIP, m.duration), m.duration);
+        segLen = Math.min(segLen, Math.max(AUTO_MIN_CLIP, (m.duration - 0.5 * (k - 1)) / k));
+        pickWindows(m, k, segLen).forEach(([a, b]) => { const c = defaultClip(m); c.start = a; c.end = b; videoClips.push(c); });
       });
     }
   }
   const imageClips = images.map(m => { const c = defaultClip(m); c.imageDuration = imgDur; c.kenBurns = true; return c; });
+  const uniqueVideoClips = dedupeClips(videoClips);
   // Interleave photos evenly between video clips.
   const out = [];
-  if (!videoClips.length) return imageClips;
+  if (!uniqueVideoClips.length) return imageClips;
+  videoClips.length = 0; videoClips.push(...uniqueVideoClips);
   const every = (videoClips.length + 1) / (imageClips.length + 1);
   let nextImg = every, ii = 0;
   videoClips.forEach((c, i) => {
@@ -1284,6 +1425,7 @@ async function autoCreate() {
     if (track) { toast(`Adding theme music: ${track.name}…`, 20000); await useLibraryTrack(track.id, { silent: true, noUndo: true }); }
   }
   const target = targetSeconds();
+  await ensureAnalyzed();
   P().clips = planEdit(target);
   applyTheme({ retrim: false });
   const effTarget = Math.min(target, totalDuration());   // cannot be longer than the footage
@@ -1577,6 +1719,9 @@ function bufferPeak(buf) {
 /* Plays [start,end] of a clip's file silently through the audio graph and records the PCM.
    Captures at 2x first; if that comes back silent (some players mute fast rates) it retries at 1x. */
 async function captureElementAudio(m, start, end, speed, onProgress) {
+  return withScratch(() => captureElementAudioInner(m, start, end, speed, onProgress));
+}
+async function captureElementAudioInner(m, start, end, speed, onProgress) {
   const fast = await captureElementAudioAt(m, start, end, speed, 2, onProgress);
   if (fast && bufferPeak(fast) > 1e-4) return { buffer: fast, rate: 2 };
   exportDiag.push(`2x capture of ${m.name} was silent; retrying at 1x`);
@@ -2857,5 +3002,5 @@ window.addEventListener('error', (e) => { if (e && e.message) toast(`Error: ${e.
 window.addEventListener('unhandledrejection', (e) => { const r = e && e.reason; toast(`Error: ${r && r.message ? r.message : r}`, 6000); });
 
 /* Exposed for debugging / tests */
-window.QuikWeb = { HAS_WEBCODECS, startOfflineExport, audioFallback, setExportMode: (m) => { exportMode = m; }, audioBufferCache, normalizeAacDescription, aacLcConfig, players, scratch, planEdit, fitToLength, targetSeconds, state, importFiles, addToTimeline, autoCreate, applyTheme, beatSync, play, pause, setPlayhead, renderAt, totalDuration, layout, setMusic, splitAtPlayhead, startExport, pickMime, useLibraryTrack, loadLibrary };
+window.QuikWeb = { ensureAnalyzed, pickWindows, dedupeClips, HAS_WEBCODECS, startOfflineExport, audioFallback, setExportMode: (m) => { exportMode = m; }, audioBufferCache, normalizeAacDescription, aacLcConfig, players, scratch, planEdit, fitToLength, targetSeconds, state, importFiles, addToTimeline, autoCreate, applyTheme, beatSync, play, pause, setPlayhead, renderAt, totalDuration, layout, setMusic, splitAtPlayhead, startExport, pickMime, useLibraryTrack, loadLibrary };
 })();
