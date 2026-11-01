@@ -279,6 +279,7 @@ async function loadImageMedia(entry) {
   } else entry.el = img;
   entry.el.className = 'stage-el'; $('#stageMedia').appendChild(entry.el);
   entry.thumb = thumbFrom(entry.el, entry.w, entry.h);
+  try { probeCtx.drawImage(entry.el, 0, 0, 64, 36); entry.scores = { step: 0, values: [], sig: cellSignature() }; } catch (e) {}
 }
 
 async function loadMedia(entry) {
@@ -1179,11 +1180,21 @@ function frameFeatures(prevL) {
   if (motion > 60) score *= 0.7;            // violent shake / whip pans
   return { score, L };
 }
+/* 4x4 grid of mean R,G,B (48 values, 0..1) of whatever is on the probe canvas. */
+function cellSignature() {
+  const d = probeCtx.getImageData(0, 0, 64, 36).data;
+  const sig = new Array(48).fill(0), cnt = new Array(16).fill(0);
+  for (let y = 0; y < 36; y++) for (let x = 0; x < 64; x++) {
+    const cell = Math.floor(y / 9) * 4 + Math.floor(x / 16), i = (y * 64 + x) * 4;
+    sig[cell * 3] += d[i]; sig[cell * 3 + 1] += d[i + 1]; sig[cell * 3 + 2] += d[i + 2]; cnt[cell]++;
+  }
+  return sig.map((v, k) => v / cnt[Math.floor(k / 3)] / 255);
+}
 async function analyzeMedia(m) {
-  if (m.kind !== 'video' || m.scores || m.duration < 1) return;
+  if (m.kind !== 'video' || (m.scores && m.scores.sig && m.scores.sig.length === 144) || m.duration < 1) return;
   const step = Math.max(1, m.duration / 60);
   const values = [];
-  const sig = new Array(16).fill(0); let sigN = 0;
+  const sig = [new Array(48).fill(0), new Array(48).fill(0), new Array(48).fill(0)], sigN = [0, 0, 0];   // first / middle / last third
   await withScratch(async () => {
     await bind(scratch, m);
     const el = scratch.el;
@@ -1193,25 +1204,24 @@ async function analyzeMedia(m) {
       try { probeCtx.drawImage(el, 0, 0, 64, 36); } catch (e) { values.push(0.5); continue; }
       const f = frameFeatures(prevL);
       values.push(f.score); prevL = f.L;
-      // 4x4 luminance grid accumulated over the file = a coarse picture of what the scene looks like
-      for (let gy = 0; gy < 4; gy++) for (let gx = 0; gx < 4; gx++) {
-        let acc = 0, n = 0;
-        for (let y = gy * 9; y < gy * 9 + 9; y++) for (let x = gx * 16; x < gx * 16 + 16; x++) { acc += f.L[y * 64 + x]; n++; }
-        sig[gy * 4 + gx] += acc / n;
-      }
-      sigN++;
+      // 4x4 colour grid accumulated over the file = a coarse picture of what the scene looks like
+      const cs = cellSignature();
+      const third = Math.min(2, Math.floor(t / m.duration * 3));
+      for (let k = 0; k < 48; k++) sig[third][k] += cs[k];
+      sigN[third]++;
     }
   });
   if (!values.length) return;
   // Smooth a little and normalise within the file
   const sm = values.map((v, i) => (values[i - 1] ?? v) * 0.25 + v * 0.5 + (values[i + 1] ?? v) * 0.25);
   const lo = Math.min(...sm), hi = Math.max(...sm);
-  m.scores = { step, values: hi - lo > 1e-3 ? sm.map(v => (v - lo) / (hi - lo)) : sm.map(() => 0.5), sig: sigN ? sig.map(v => v / sigN / 255) : null };
+  m.scores = { step, values: hi - lo > 1e-3 ? sm.map(v => (v - lo) / (hi - lo)) : sm.map(() => 0.5), sig: sigN.some(n => n) ? [0, 1, 2].flatMap(th => { const n = sigN[th] || sigN.find(x => x) || 1; const src = sigN[th] ? sig[th] : sig[sigN.findIndex(x => x)]; return src.map(v => v / n); }) : null };
   save();
 }
 function queueAnalysis(list) {
-  list.forEach(m => { if (m.kind === 'video' && !m.scores && !analysisQueue.includes(m)) analysisQueue.push(m); });
-  analysisProgress.total += list.filter(m => m.kind === 'video' && !m.scores).length;
+  const needs = (m) => m.kind === 'video' && !(m.scores && m.scores.sig && m.scores.sig.length === 144);
+  list.forEach(m => { if (needs(m) && !analysisQueue.includes(m)) analysisQueue.push(m); });
+  analysisProgress.total += list.filter(needs).length;
   runAnalysis();
 }
 async function runAnalysis() {
@@ -1228,7 +1238,7 @@ async function runAnalysis() {
 }
 /* Waits (with a progress toast) until every video in the bin has an interest curve. */
 async function ensureAnalyzed(maxWaitMs = 120000) {
-  const pending = () => Array.from(state.media.values()).filter(m => m.kind === 'video' && !m.scores);
+  const pending = () => Array.from(state.media.values()).filter(m => m.kind === 'video' && !(m.scores && m.scores.sig && m.scores.sig.length === 144));
   if (!pending().length) return true;
   queueAnalysis(pending());
   const t0 = performance.now();
@@ -1242,8 +1252,28 @@ async function ensureAnalyzed(maxWaitMs = 120000) {
 function sceneSimilarity(a, b) {
   const sa = a.scores && a.scores.sig, sb = b.scores && b.scores.sig;
   if (!sa || !sb) return 0;
-  let d = 0; for (let i = 0; i < 16; i++) d += Math.abs(sa[i] - sb[i]);
-  return clamp(1 - (d / 16) / 0.12, 0, 1);   // avg difference of 12% brightness or more = different scenes
+  if (sa.length !== sb.length) return 0;      // old brightness-only fingerprint vs new colour one
+  let d = 0; for (let i = 0; i < sa.length; i++) d += Math.abs(sa[i] - sb[i]);
+  return clamp(1 - (d / sa.length) / 0.12, 0, 1);   // avg difference of 12% per colour channel or more = different scenes
+}
+/* Same content? Identical file (name+size), or same duration/size with an almost identical look. */
+function sameContent(a, b) {
+  if (a.kind !== b.kind) return false;
+  if (a.name === b.name && a.blob && b.blob && a.blob.size === b.blob.size) return true;
+  const sim = sceneSimilarity(a, b);
+  if (a.kind === 'video') return Math.abs(a.duration - b.duration) < 0.1 && a.w === b.w && a.h === b.h && sim > 0.95;
+  return sim > 0.93 && a.w === b.w && a.h === b.h;
+}
+/* Collapses files that are the same content or show the same scene into one representative each
+   (first in bin order). strict: similarity above which two files count as the same scene. */
+function uniqueMedia(list, strict) {
+  const kept = [];
+  let dropped = 0;
+  list.forEach(m => {
+    const twin = kept.find(k => sameContent(k, m) || sceneSimilarity(k, m) >= strict);
+    if (twin) dropped++; else kept.push(m);
+  });
+  return { kept, dropped };
 }
 /* Average interest of the window [s, s+len] of a video (0.5 when unknown). */
 function windowScore(m, s, len) {
@@ -1327,12 +1357,27 @@ function planEdit(target) {
   const pace = PACE[P().pace] || PACE.medium;
   let videos = [], images = [];
   state.media.forEach(m => (m.kind === 'video' ? videos : images).push(m));
+  // Hard uniqueness: one file per piece of content / scene, even if the video ends up shorter.
+  const uv = uniqueMedia(videos, 0.85), ui = uniqueMedia(images, 0.85);
+  videos = uv.kept; images = ui.kept;
+  planEdit.lastDropped = uv.dropped + ui.dropped;
   if (!videos.length && !images.length) return [];
   // Clip count follows the pace (longer, fewer clips); the 2.5s minimum only bounds it.
   const maxClips = clamp(Math.round(target / pace), 1, Math.max(1, Math.floor(target / AUTO_MIN_CLIP)));
   // Photos take at most a third of the slots (all of them when there is no video).
   const imgSlots = videos.length ? Math.min(images.length, Math.floor(maxClips / 3)) : Math.min(images.length, maxClips);
-  images = pickEvenly(images, imgSlots);
+  if (images.length > imgSlots) {
+    // Spread the photo picks across the bin while avoiding look-alikes.
+    const chosenI = [];
+    const pool = images.slice();
+    while (chosenI.length < imgSlots && pool.length) {
+      let bi = 0, bv = -1;
+      pool.forEach((m, idx) => { const sim = chosenI.reduce((mx, c) => Math.max(mx, sceneSimilarity(m, c)), 0); const v = (1 - 0.9 * sim) + 0.001 * (idx % 7); if (v > bv) { bv = v; bi = idx; } });
+      chosenI.push(pool.splice(bi, 1)[0]);
+    }
+    const order = new Map(images.map((m, i) => [m.id, i]));
+    images = chosenI.sort((a, b) => order.get(a.id) - order.get(b.id));
+  }
   let imgDur = clamp(pace, 2, 4);
   if (images.length && images.length * imgDur > target * 0.4) imgDur = Math.max(2, target * 0.4 / images.length);
   const videoBudget = Math.max(0, target - images.length * imgDur);
@@ -1348,8 +1393,13 @@ function planEdit(target) {
       const chosen = [];
       const pool = ranked.slice();
       while (chosen.length < videoSlots && pool.length) {
-        let bi = 0, bv = -1;
-        pool.forEach((r, idx) => { const sim = chosen.reduce((mx, c) => Math.max(mx, sceneSimilarity(r.m, c.m)), 0); const v = r.v * (1 - 0.7 * sim); if (v > bv) { bv = v; bi = idx; } });
+        let bi = -1, bv = -1;
+        pool.forEach((r, idx) => {
+          const sim = chosen.reduce((mx, c) => Math.max(mx, sceneSimilarity(r.m, c.m)), 0);
+          if (sim >= 0.7) return;                      // same scene as one already chosen: skip
+          const v = r.v * (1 - 0.7 * sim); if (v > bv) { bv = v; bi = idx; }
+        });
+        if (bi < 0) break;                              // only look-alikes left: leave slots empty
         chosen.push(pool.splice(bi, 1)[0]);
       }
       keep = chosen.sort((a, b) => a.i - b.i).map(r => r.m);
@@ -1481,8 +1531,10 @@ async function autoCreate() {
   renderAll(); save();
   if (phoneLayout.matches) $('.tab[data-tab="clip"]').click();
   const got = totalDuration();
-  const short = got < target * 0.9 ? ` (only ${fmt(got)} of footage for a ${fmtLen(target)} target)` : '';
-  toast(`Auto-created a ${THEMES[P().theme].name} edit · ${fmt(got)}${short}${P().music ? ` · ♫ ${P().music.name.replace(/\.mp3$/, '')}` : ''}`, 4000);
+  const short = got < target * 0.9 ? ` (only ${fmt(got)} of unique footage for a ${fmtLen(target)} target)` : '';
+  const uniq = `${P().clips.length} clips from ${new Set(P().clips.map(c => c.mediaId)).size} files`;
+  const skipped = planEdit.lastDropped ? ` · ${planEdit.lastDropped} duplicate/same-scene file${planEdit.lastDropped > 1 ? 's' : ''} skipped` : '';
+  toast(`Auto-created a ${THEMES[P().theme].name} edit · ${fmt(got)} · ${uniq}${skipped}${short}${P().music ? ` · ♫ ${P().music.name.replace(/\.mp3$/, '')}` : ''}`, 5000);
 }
 function beatSync({ silent = false, noUndo = false, target = null } = {}) {
   const mus = P().music;
@@ -3066,5 +3118,5 @@ window.addEventListener('error', (e) => { if (e && e.message) toast(`Error: ${e.
 window.addEventListener('unhandledrejection', (e) => { const r = e && e.reason; toast(`Error: ${r && r.message ? r.message : r}`, 6000); });
 
 /* Exposed for debugging / tests */
-window.QuikWeb = { ensureAnalyzed, pickWindows, dedupeClips, HAS_WEBCODECS, startOfflineExport, audioFallback, setExportMode: (m) => { exportMode = m; }, audioBufferCache, normalizeAacDescription, aacLcConfig, players, scratch, planEdit, fitToLength, targetSeconds, state, importFiles, addToTimeline, autoCreate, applyTheme, beatSync, play, pause, setPlayhead, renderAt, totalDuration, layout, setMusic, splitAtPlayhead, startExport, pickMime, useLibraryTrack, loadLibrary };
+window.QuikWeb = { ensureAnalyzed, pickWindows, dedupeClips, uniqueMedia, sceneSimilarity, HAS_WEBCODECS, startOfflineExport, audioFallback, setExportMode: (m) => { exportMode = m; }, audioBufferCache, normalizeAacDescription, aacLcConfig, players, scratch, planEdit, fitToLength, targetSeconds, state, importFiles, addToTimeline, autoCreate, applyTheme, beatSync, play, pause, setPlayhead, renderAt, totalDuration, layout, setMusic, splitAtPlayhead, startExport, pickMime, useLibraryTrack, loadLibrary };
 })();
