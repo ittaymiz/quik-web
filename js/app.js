@@ -215,6 +215,7 @@ async function loadVideoMedia(entry) {
   scratch.preload = 'auto'; scratch.muted = true; scratch.playsInline = true; scratch.setAttribute('muted', ''); scratch.src = entry.url;
   await new Promise(res => { scratch.addEventListener('loadedmetadata', res, { once: true }); scratch.addEventListener('error', res, { once: true }); setTimeout(res, 3000); });
   entry.scratch = scratch;
+  el.className = 'stage-el'; $('#stageMedia').appendChild(el);
   entry.thumb = await grabVideoThumb(scratch, Math.min(0.5, entry.duration / 2), entry.w, entry.h);
   if (isBlack(entry.thumb)) entry.thumb = await grabVideoThumb(el, Math.min(0.5, entry.duration / 2), entry.w, entry.h);
   connectAudioEl(el);
@@ -245,6 +246,7 @@ async function loadImageMedia(entry) {
     c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
     entry.el = c; entry.w = c.width; entry.h = c.height;
   } else entry.el = img;
+  entry.el.className = 'stage-el'; $('#stageMedia').appendChild(entry.el);
   entry.thumb = thumbFrom(entry.el, entry.w, entry.h);
 }
 
@@ -302,6 +304,7 @@ async function removeMedia(id) {
     if (!clipById(state.selectedId)) state.selectedId = null;
   }
   state.media.delete(id);
+  if (m.el && m.el.parentElement) m.el.parentElement.removeChild(m.el);
   URL.revokeObjectURL(m.url);
   await DB.deleteFile(id);
   state.snapCache.clear();
@@ -386,7 +389,10 @@ function connectAudioEl(el) {
    ====================================================================== */
 const canvas = $('#preview');
 const ctx = canvas.getContext('2d');
+const ctxRef = { ctx };
 let W = canvas.width, H = canvas.height;
+function drawSourceTo(target, c, m, el, lt, dur) { const keep = ctxRef.ctx; ctxRef.ctx = target; try { drawSource(c, m, el, lt, dur); } finally { ctxRef.ctx = keep; } }
+function drawTextTo(target, c, lt, dur) { const keep = ctxRef.ctx; ctxRef.ctx = target; try { drawText(c, lt, dur); } finally { ctxRef.ctx = keep; } }
 
 function setCanvasSize(long) {
   const [aw, ah] = ASPECTS[P().aspect] || ASPECTS['16:9'];
@@ -412,6 +418,7 @@ function filterCss(f) {
 }
 
 function drawSource(c, m, el, lt, dur) {
+  const cx = ctxRef.ctx;
   const sw = m.w, sh = m.h;
   let scale = c.fit === 'cover' ? Math.max(W / sw, H / sh) : Math.min(W / sw, H / sh);
   let z = c.zoom, drift = 0;
@@ -424,47 +431,49 @@ function drawSource(c, m, el, lt, dur) {
   const dw = sw * scale, dh = sh * scale;
   const dx = (W - dw) / 2 - c.panX * Math.abs(dw - W) / 2 + drift;
   const dy = (H - dh) / 2 - c.panY * Math.abs(dh - H) / 2;
-  ctx.save();
+  cx.save();
   const css = filterCss(c.filter);
-  if (HAS_CTX_FILTER) ctx.filter = css;
-  try { ctx.drawImage(el, dx, dy, dw, dh); } catch (e) { /* frame not ready */ }
-  ctx.restore();
+  if (HAS_CTX_FILTER) cx.filter = css;
+  try { cx.drawImage(el, dx, dy, dw, dh); } catch (e) { /* frame not ready */ }
+  cx.restore();
   if (!HAS_CTX_FILTER && css !== 'none') applyFilterFallback(css);
   if (c.filter.vignette > 0) {
-    const g = ctx.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.35, W / 2, H / 2, Math.max(W, H) * 0.75);
+    const g = cx.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.35, W / 2, H / 2, Math.max(W, H) * 0.75);
     g.addColorStop(0, 'rgba(0,0,0,0)');
     g.addColorStop(1, `rgba(0,0,0,${0.85 * c.filter.vignette})`);
-    ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+    cx.fillStyle = g; cx.fillRect(0, 0, W, H);
   }
 }
 
 /* Approximates CSS filter functions with canvas blend modes when ctx.filter is unavailable. */
 function applyFilterFallback(css) {
+  const cx = ctxRef.ctx;
   const re = /(\w[\w-]*)\(([^)]*)\)/g; let m;
-  ctx.save();
+  cx.save();
   while ((m = re.exec(css))) {
     const fn = m[1]; const v = parseFloat(m[2]);
-    const blend = (mode, color, alpha) => { ctx.globalCompositeOperation = mode; ctx.globalAlpha = clamp(alpha, 0, 1); ctx.fillStyle = color; ctx.fillRect(0, 0, W, H); };
+    const blend = (mode, color, alpha) => { cx.globalCompositeOperation = mode; cx.globalAlpha = clamp(alpha, 0, 1); cx.fillStyle = color; cx.fillRect(0, 0, W, H); };
     switch (fn) {
       case 'grayscale': blend('saturation', '#808080', v); break;
       case 'saturate':
         if (v < 1) blend('saturation', '#808080', 1 - v);
-        else if (v > 1) { ctx.globalCompositeOperation = 'saturation'; ctx.globalAlpha = clamp((v - 1) * 0.6, 0, 1); ctx.drawImage(canvas, 0, 0); }
+        else if (v > 1) { cx.globalCompositeOperation = 'saturation'; cx.globalAlpha = clamp((v - 1) * 0.6, 0, 1); cx.drawImage(canvas, 0, 0); }
         break;
       case 'sepia': blend('color', '#a67c52', v * 0.8); break;
       case 'brightness': if (v > 1) blend('screen', '#ffffff', (v - 1)); else if (v < 1) blend('multiply', '#000000', 1 - v); break;
       case 'contrast':
-        if (v > 1) { ctx.globalCompositeOperation = 'overlay'; ctx.globalAlpha = clamp((v - 1) * 1.2, 0, 1); ctx.drawImage(canvas, 0, 0); }
+        if (v > 1) { cx.globalCompositeOperation = 'overlay'; cx.globalAlpha = clamp((v - 1) * 1.2, 0, 1); cx.drawImage(canvas, 0, 0); }
         else if (v < 1) blend('source-over', '#808080', (1 - v));
         break;
       case 'hue-rotate': blend('hue', v < 0 ? '#4f8cff' : '#ff7a4f', Math.min(0.35, Math.abs(v) / 90)); break;
     }
   }
-  ctx.restore();
-  ctx.globalCompositeOperation = 'source-over'; ctx.globalAlpha = 1;
+  cx.restore();
+  cx.globalCompositeOperation = 'source-over'; cx.globalAlpha = 1;
 }
 
 function drawText(c, lt, dur) {
+  const cx = ctxRef.ctx;
   const t = c.text;
   const content = (t.content || '').trim();
   if (!content) return;
@@ -485,11 +494,11 @@ function drawText(c, lt, dur) {
     let remain = shown;
     lines = lines.map(l => { const s = l.slice(0, Math.max(0, remain)); remain -= l.length + 1; return s; });
   }
-  ctx.save();
-  ctx.globalAlpha = (t.anim === 'fade' || t.anim === 'slideUp' ? p : 1) * outP;
-  ctx.font = `${weight} ${fontSize}px ${family}`;
-  ctx.textBaseline = 'middle';
-  ctx.textAlign = isLower ? 'left' : 'center';
+  cx.save();
+  cx.globalAlpha = (t.anim === 'fade' || t.anim === 'slideUp' ? p : 1) * outP;
+  cx.font = `${weight} ${fontSize}px ${family}`;
+  cx.textBaseline = 'middle';
+  cx.textAlign = isLower ? 'left' : 'center';
   const x = isLower ? W * 0.08 : W / 2;
   let y0;
   if (isLower) y0 = H * 0.86 - (lines.length - 1) * lineH;
@@ -499,28 +508,28 @@ function drawText(c, lt, dur) {
   let dy = 0, scale = 1;
   if (t.anim === 'slideUp') dy = (1 - easeOut(p)) * fontSize * 0.8;
   if (t.anim === 'pop') scale = 0.6 + 0.4 * easeOut(p);
-  ctx.translate(x, y0 + dy); ctx.scale(scale, scale); ctx.translate(-x, -(y0 + dy));
-  ctx.shadowColor = 'rgba(0,0,0,0.6)'; ctx.shadowBlur = fontSize * 0.15; ctx.shadowOffsetY = fontSize * 0.04;
+  cx.translate(x, y0 + dy); cx.scale(scale, scale); cx.translate(-x, -(y0 + dy));
+  cx.shadowColor = 'rgba(0,0,0,0.6)'; cx.shadowBlur = fontSize * 0.15; cx.shadowOffsetY = fontSize * 0.04;
   lines.forEach((line, i) => {
     const y = y0 + dy + i * lineH;
     if (t.style === 'box' || isLower) {
-      const w = ctx.measureText(line).width;
+      const w = cx.measureText(line).width;
       const padX = fontSize * 0.4, padY = fontSize * 0.2;
-      ctx.save(); ctx.shadowColor = 'transparent';
-      ctx.fillStyle = t.accent;
+      cx.save(); cx.shadowColor = 'transparent';
+      cx.fillStyle = t.accent;
       const bx = isLower ? x - padX : x - w / 2 - padX;
-      ctx.fillRect(bx, y - lineH / 2 - padY / 2 + fontSize * 0.1, w + padX * 2, lineH + padY - fontSize * 0.1);
-      if (isLower) { ctx.fillStyle = t.color; ctx.fillRect(bx - fontSize * 0.25, y - lineH / 2 - padY / 2 + fontSize * 0.1, fontSize * 0.12, lineH + padY - fontSize * 0.1); }
-      ctx.restore();
+      cx.fillRect(bx, y - lineH / 2 - padY / 2 + fontSize * 0.1, w + padX * 2, lineH + padY - fontSize * 0.1);
+      if (isLower) { cx.fillStyle = t.color; cx.fillRect(bx - fontSize * 0.25, y - lineH / 2 - padY / 2 + fontSize * 0.1, fontSize * 0.12, lineH + padY - fontSize * 0.1); }
+      cx.restore();
     }
     if (t.style === 'outline') {
-      ctx.lineWidth = fontSize * 0.1; ctx.lineJoin = 'round'; ctx.strokeStyle = t.accent;
-      ctx.strokeText(line, x, y);
+      cx.lineWidth = fontSize * 0.1; cx.lineJoin = 'round'; cx.strokeStyle = t.accent;
+      cx.strokeText(line, x, y);
     }
-    ctx.fillStyle = t.color;
-    ctx.fillText(line, x, y);
+    cx.fillStyle = t.color;
+    cx.fillText(line, x, y);
   });
-  ctx.restore();
+  cx.restore();
 }
 
 function snapshotCanvas() {
@@ -538,6 +547,7 @@ function snapshotFor(idx) {
   if (!clip) return null;
   const snap = state.snapCache.get(clip.id);
   if (snap && snap.width === W && snap.height === H) return snap;
+  if (snap && !state.playing) state.snapCache.delete(clip.id);   // stage-sized snapshot: re-render at canvas size
   if (!state.playing && !snapPending.has(clip.id)) {
     snapPending.add(clip.id);
     renderClipLastFrame(clip).then(c => {
@@ -636,6 +646,164 @@ function setPlayhead(t, render = true) {
 }
 
 /* ======================================================================
+   Stage: native playback layer used while playing (video elements render
+   themselves; look, reframe, text and transitions are applied as CSS).
+   ====================================================================== */
+const stage = $('#stage'), stagePrev = $('#stagePrev'), stageText = $('#stageText'), stageOverlay = $('#stageOverlay'), stageVignette = $('#stageVignette');
+let stageClip = null, stageTextEl = null, stageH = 540;
+
+function sizeStage() {
+  const wrap = $('#previewWrap').getBoundingClientRect();
+  const r = canvas.getBoundingClientRect();
+  stage.style.left = `${r.left - wrap.left}px`; stage.style.top = `${r.top - wrap.top}px`;
+  stage.style.width = `${r.width}px`; stage.style.height = `${r.height}px`;
+  stageH = r.height || 540;
+  if (stageTextEl && stageClip) stageTextEl.style.fontSize = `${stageClip.text.size * stageH}px`;
+}
+function showStage(on) {
+  if (on) { sizeStage(); stage.hidden = false; canvas.style.visibility = 'hidden'; }
+  else {
+    stage.hidden = true; canvas.style.visibility = '';
+    state.media.forEach(m => { if (m.el && m.el.style) m.el.style.visibility = 'hidden'; });
+    stagePrev.style.display = 'none'; stageOverlay.style.background = 'transparent'; stageText.innerHTML = ''; stageTextEl = null; stageClip = null;
+  }
+}
+/* Same geometry as drawSource(), expressed in percentages of the stage. */
+function placeStageEl(c, m, lt, dur) {
+  const el = m.el;
+  const sw = m.w, sh = m.h;
+  let scale = c.fit === 'cover' ? Math.max(W / sw, H / sh) : Math.min(W / sw, H / sh);
+  let z = c.zoom, drift = 0;
+  if (c.kind === 'image' && c.kenBurns) { const p = clamp(lt / dur, 0, 1); z *= 1 + 0.12 * p; drift = (p - 0.5) * 0.06 * W; }
+  scale *= z;
+  const dw = sw * scale, dh = sh * scale;
+  const dx = (W - dw) / 2 - c.panX * Math.abs(dw - W) / 2 + drift;
+  const dy = (H - dh) / 2 - c.panY * Math.abs(dh - H) / 2;
+  el.style.left = `${dx / W * 100}%`; el.style.top = `${dy / H * 100}%`;
+  el.style.width = `${dw / W * 100}%`; el.style.height = `${dh / H * 100}%`;
+}
+function stageSetup(loc) {
+  const { clip, idx } = loc;
+  const m = state.media.get(clip.mediaId);
+  stageClip = clip;
+  state.media.forEach(x => { if (x.el && x.el !== (m && m.el) && x.el.style) x.el.style.visibility = 'hidden'; });
+  if (m && m.el.style) {
+    placeStageEl(clip, m, loc.lt, loc.dur);
+    const f = filterCss(clip.filter);
+    m.el.style.filter = f === 'none' ? '' : f;
+    m.el.style.visibility = 'visible';
+  }
+  const v = clip.filter.vignette;
+  stageVignette.style.background = v > 0 ? `radial-gradient(ellipse at center, rgba(0,0,0,0) 45%, rgba(0,0,0,${0.85 * v}) 100%)` : 'transparent';
+  // Text
+  stageText.innerHTML = ''; stageTextEl = null;
+  const t = clip.text;
+  if ((t.content || '').trim()) {
+    const d = document.createElement('div');
+    d.className = 'stage-text';
+    const isLower = t.style === 'lower';
+    d.style.fontWeight = t.style === 'minimal' ? 300 : 800;
+    d.style.fontSize = `${t.size * stageH}px`;
+    d.style.color = t.color;
+    d.style.textAlign = isLower ? 'left' : 'center';
+    d.style.maxWidth = '90%';
+    if (isLower) { d.style.left = '8%'; d.style.bottom = '10%'; d.style.transformOrigin = 'left bottom'; }
+    else {
+      d.style.left = '50%';
+      d.style.top = t.pos === 'top' ? '14%' : t.pos === 'bottom' ? '86%' : '50%';
+      d.style.transform = 'translate(-50%, -50%)';
+    }
+    if (t.style === 'outline') { d.style.webkitTextStroke = `${0.05 * t.size * stageH}px ${t.accent}`; d.style.paintOrder = 'stroke fill'; }
+    if (t.style === 'box' || isLower) { d.style.background = t.accent; d.style.padding = '0.1em 0.4em'; d.style.textShadow = 'none'; }
+    if (isLower) d.style.borderLeft = `0.12em solid ${t.color}`;
+    d.textContent = t.content.trim();
+    stageText.appendChild(d);
+    stageTextEl = d;
+  }
+  // Transition source: last frame of the previous clip
+  const tr = clip.transition;
+  stagePrev.style.display = 'none';
+  if (idx > 0 && tr && tr.type !== 'none') {
+    const prev = state.snapCache.get(P().clips[idx - 1].id);
+    if (prev) {
+      if (stagePrev.width !== prev.width || stagePrev.height !== prev.height) { stagePrev.width = prev.width; stagePrev.height = prev.height; }
+      stagePrev.getContext('2d').drawImage(prev, 0, 0);
+      stagePrev.style.display = 'block';
+      stagePrev.style.opacity = '1'; stagePrev.style.transform = 'none'; stagePrev.style.clipPath = 'none';
+    }
+  } else if (idx > 0) {
+    // Hard cut: show the previous frame until the new video has painted one (avoids a black blink).
+    const prev = state.snapCache.get(P().clips[idx - 1].id);
+    if (prev) {
+      if (stagePrev.width !== prev.width || stagePrev.height !== prev.height) { stagePrev.width = prev.width; stagePrev.height = prev.height; }
+      stagePrev.getContext('2d').drawImage(prev, 0, 0);
+      stagePrev.style.display = 'block'; stagePrev.style.opacity = '1'; stagePrev.style.transform = 'none'; stagePrev.style.clipPath = 'none';
+    }
+  }
+  stageOverlay.style.background = 'transparent';
+}
+function stageUpdate(loc) {
+  const { clip, lt, dur } = loc;
+  const m = state.media.get(clip.mediaId);
+  if (clip.kind === 'image' && clip.kenBurns && m) placeStageEl(clip, m, lt, dur);
+  if (stageTextEl) {
+    const t = clip.text;
+    const showDur = t.dur > 0 ? Math.max(0.5, dur * t.dur) : dur;
+    if (lt > showDur) stageTextEl.style.opacity = '0';
+    else {
+      const p = t.anim === 'none' ? 1 : clamp(lt / 0.5, 0, 1);
+      const outP = clamp((showDur - lt) / 0.3, 0, 1);
+      let opacity = outP, extra = '';
+      if (t.anim === 'fade' || t.anim === 'slideUp') opacity *= p;
+      if (t.anim === 'slideUp') extra = ` translateY(${(1 - easeOut(p)) * 0.8}em)`;
+      if (t.anim === 'pop') extra = ` scale(${0.6 + 0.4 * easeOut(p)})`;
+      if (t.anim === 'typewriter') {
+        const full = t.content.trim();
+        const want = full.slice(0, Math.floor(clamp(lt / Math.min(1.5, showDur), 0, 1) * full.length));
+        if (stageTextEl.textContent !== want) stageTextEl.textContent = want;
+      }
+      stageTextEl.style.opacity = String(opacity);
+      stageTextEl.style.transform = (t.style === 'lower' ? '' : 'translate(-50%, -50%)') + extra;
+    }
+  }
+  const tr = clip.transition;
+  const hasPrev = stagePrev.style.display === 'block';
+  if (tr && tr.type !== 'none' && lt < tr.duration) {
+    const p = clamp(lt / tr.duration, 0, 1);
+    switch (tr.type) {
+      case 'crossfade': if (hasPrev) stagePrev.style.opacity = String(1 - easeInOut(p)); break;
+      case 'fade':
+        if (hasPrev && p < 0.5) { stagePrev.style.opacity = '1'; stageOverlay.style.background = `rgba(0,0,0,${p * 2})`; }
+        else { if (hasPrev) stagePrev.style.opacity = '0'; stageOverlay.style.background = `rgba(0,0,0,${hasPrev ? 1 - (p - 0.5) * 2 : 1 - p})`; }
+        break;
+      case 'flash':
+        if (hasPrev && p < 0.5) { stagePrev.style.opacity = '1'; stageOverlay.style.background = `rgba(255,255,255,${p * 2})`; }
+        else { if (hasPrev) stagePrev.style.opacity = '0'; stageOverlay.style.background = `rgba(255,255,255,${hasPrev ? 1 - (p - 0.5) * 2 : 1 - p})`; }
+        break;
+      case 'slide': if (hasPrev) stagePrev.style.transform = `translateX(${-easeInOut(p) * 100}%)`; break;
+      case 'wipe': if (hasPrev) stagePrev.style.clipPath = `inset(0 0 0 ${easeInOut(p) * 100}%)`; break;
+      case 'zoom': if (hasPrev) { stagePrev.style.transform = `scale(${1 + easeOut(p) * 0.6})`; stagePrev.style.opacity = String(1 - p); } break;
+    }
+  } else {
+    if (hasPrev && (frameReady || (tr && tr.type !== 'none') || lt > 0.4)) stagePrev.style.display = 'none';
+    stageOverlay.style.background = 'transparent';
+  }
+}
+/* Captures the previous clip's final frame straight from its element at the cut (one small draw). */
+function snapshotClip(loc) {
+  const m = state.media.get(loc.clip.mediaId);
+  if (!m) return null;
+  const c = document.createElement('canvas');
+  c.width = Math.min(W, 960); c.height = Math.round(c.width * H / W);
+  const x = c.getContext('2d');
+  const saveW = W, saveH = H;
+  W = c.width; H = c.height;
+  try { x.fillStyle = '#000'; x.fillRect(0, 0, W, H); drawSourceTo(x, loc.clip, m, m.el, loc.dur, loc.dur); drawTextTo(x, loc.clip, loc.dur, loc.dur); }
+  finally { W = saveW; H = saveH; }
+  return c;
+}
+
+/* ======================================================================
    Playback engine
    ====================================================================== */
 let wallStart = 0, tStart = 0, activeIdx = -1, rafId = 0, holdFrame = null, frameReady = true;
@@ -659,6 +827,7 @@ function startClipMedia(clip, lt) {
   const m = state.media.get(clip.mediaId);
   if (!m || clip.kind !== 'video') return;
   const el = m.el;
+  if (prerolled.has(clip.id) && Math.abs(el.currentTime - (clip.start + lt * clip.speed)) < 0.25) { el.playbackRate = clamp(clip.speed, 0.0625, 16); setElVolume(el, effectiveClipVolume(clip)); el.play().catch(() => {}); return; }
   el.playbackRate = clamp(clip.speed, 0.0625, 16);
   try { el.preservesPitch = true; } catch (e) {}
   setElVolume(el, effectiveClipVolume(clip));
@@ -726,6 +895,7 @@ function play() {
   if (state.playhead >= total - 0.05) state.playhead = 0;
   state.playing = true;
   wallStart = performance.now(); tStart = state.playhead; activeIdx = -1; prerolled.clear();
+  if (!state.exporting) showStage(true);
   startMusic(state.playhead);
   $('#playBtn').textContent = '❚❚';
   cancelAnimationFrame(rafId);
@@ -739,6 +909,7 @@ function pause() {
   activeIdx = -1; prerolled.clear();
   stopMusicNode();
   musicEl.pause();
+  showStage(false);
   $('#playBtn').textContent = '▶';
   renderAt(state.playhead);
 }
@@ -759,11 +930,13 @@ function tick() {
   const loc = locate(t);
   if (loc.idx !== activeIdx) {
     if (activeIdx >= 0 && P().clips[activeIdx]) {
-      state.snapCache.set(P().clips[activeIdx].id, snapshotCanvas());
+      const prevLoc = layout()[activeIdx];
+      if (prevLoc) { const snap = state.exporting ? snapshotCanvas() : snapshotClip(prevLoc); if (snap) state.snapCache.set(P().clips[activeIdx].id, snap); }
       stopClipMedia(P().clips[activeIdx]);
     }
     activeIdx = loc.idx;
     startClipMedia(loc.clip, loc.lt);
+    if (!state.exporting) stageSetup(loc);
     // Until the new clip has actually presented a frame, keep showing the last frame of the previous one.
     const mm = state.media.get(loc.clip.mediaId);
     if (loc.clip.kind === 'video' && mm && typeof mm.el.requestVideoFrameCallback === 'function') {
@@ -782,8 +955,10 @@ function tick() {
   }
   state.playhead = t;
   prerollNext(loc);
-  if (!frameReady && holdFrame) { ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.filter = 'none'; ctx.drawImage(holdFrame, 0, 0); }
-  else drawFrameNow(loc);
+  if (state.exporting) {
+    if (!frameReady && holdFrame) { ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.filter = 'none'; ctx.drawImage(holdFrame, 0, 0); }
+    else drawFrameNow(loc);
+  } else stageUpdate(loc);
   if (P().music) {
     if (musicGain) musicGain.gain.value = musicVolumeAt(t);
     else { setElVolume(musicEl, musicVolumeAt(t)); if (musicEl.paused && musicEl.src && (P().music.loop || P().music.offset + t < P().music.duration)) musicEl.play().catch(() => {}); }
@@ -1504,6 +1679,7 @@ function startRecorderExport(res, fps) {
   };
   state.exporting = true; state.exportCancelled = false;
   keepAwake(true);
+  showStage(false);
   if (masterGain) masterGain.gain.value = 0;   // silent while rendering
   $('#exportProgressWrap').hidden = false;
   $('#exportStartBtn').disabled = true;
@@ -1912,6 +2088,7 @@ function bindUI() {
     await DB.clear();
     state.media.forEach(m => URL.revokeObjectURL(m.url));
     state.media.clear();
+    $('#stageMedia').innerHTML = '';
     state.project = newProject(); state.selectedId = null; state.playhead = 0;
     state.undo = []; state.redo = []; state.snapCache.clear();
     musicEl.pause(); musicEl.removeAttribute('src');
@@ -1947,6 +2124,9 @@ function bindUI() {
   $('#frameGrabBtn').addEventListener('click', frameGrab);
   $('#fullscreenBtn').addEventListener('click', () => { const w = $('#previewWrap'); if (document.fullscreenElement) document.exitFullscreen(); else if (w.requestFullscreen) w.requestFullscreen(); });
   canvas.addEventListener('click', () => { if (P().clips.length) togglePlay(); });
+  stage.addEventListener('click', () => { if (P().clips.length) togglePlay(); });
+  window.addEventListener('resize', () => { if (state.playing) sizeStage(); });
+  document.addEventListener('fullscreenchange', () => setTimeout(() => { if (state.playing) sizeStage(); }, 50));
 
   // Clip tab
   const trimApply = (which) => (v, c) => {

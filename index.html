@@ -59,6 +59,14 @@
     <section class="preview-area">
       <div class="preview-wrap" id="previewWrap">
         <canvas id="preview" width="1280" height="720"></canvas>
+        <!-- Native playback stage: video elements play here directly (smooth on phones); canvas is used when paused. -->
+        <div id="stage" class="stage" hidden>
+          <div id="stageMedia" class="stage-layer"></div>
+          <canvas id="stagePrev" class="stage-prev" width="960" height="540"></canvas>
+          <div id="stageVignette" class="stage-layer"></div>
+          <div id="stageText" class="stage-layer"></div>
+          <div id="stageOverlay" class="stage-layer"></div>
+        </div>
         <div id="emptyHint" class="empty-hint">
           <div class="big">Quik Web</div>
           <p>Add videos and photos, press <b>Auto Create</b>, then fine-tune every clip.</p>
