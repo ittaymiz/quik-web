@@ -306,6 +306,8 @@ async function importFiles(files) {
   for (let i = 0; i < list.length; i++) {
     const file = list[i];
     toast(`Importing ${i + 1}/${list.length}: ${file.name}…`, 60000);
+    const dup = Array.from(state.media.values()).find(m => m.name === file.name && m.blob && m.blob.size === file.size);
+    if (dup) { failed.push(`${file.name}: already in the media bin`); continue; }
     const entry = { id: uid(), kind: mediaKind(file), name: file.name || `file-${i + 1}`, blob: file };
     try {
       await loadMedia(entry);
@@ -321,7 +323,8 @@ async function importFiles(files) {
   renderMediaGrid();
   save();
   queueAnalysis(added);
-  if (failed.length) toast(`Could not open ${failed.length} file${failed.length > 1 ? 's' : ''} – ${failed[0]}`, 7000);
+  if (failed.length && failed.every(f => /already in the media bin/.test(f))) toast(`Skipped ${failed.length} duplicate file${failed.length > 1 ? 's' : ''} (already imported)`, 4000);
+  else if (failed.length) toast(`Could not open ${failed.length} file${failed.length > 1 ? 's' : ''} – ${failed[0]}`, 7000);
   else if (added.length) toast(`Added ${added.length} file${added.length > 1 ? 's' : ''} to the media bin`);
   return added;
 }
@@ -1180,6 +1183,7 @@ async function analyzeMedia(m) {
   if (m.kind !== 'video' || m.scores || m.duration < 1) return;
   const step = Math.max(1, m.duration / 60);
   const values = [];
+  const sig = new Array(16).fill(0); let sigN = 0;
   await withScratch(async () => {
     await bind(scratch, m);
     const el = scratch.el;
@@ -1189,13 +1193,20 @@ async function analyzeMedia(m) {
       try { probeCtx.drawImage(el, 0, 0, 64, 36); } catch (e) { values.push(0.5); continue; }
       const f = frameFeatures(prevL);
       values.push(f.score); prevL = f.L;
+      // 4x4 luminance grid accumulated over the file = a coarse picture of what the scene looks like
+      for (let gy = 0; gy < 4; gy++) for (let gx = 0; gx < 4; gx++) {
+        let acc = 0, n = 0;
+        for (let y = gy * 9; y < gy * 9 + 9; y++) for (let x = gx * 16; x < gx * 16 + 16; x++) { acc += f.L[y * 64 + x]; n++; }
+        sig[gy * 4 + gx] += acc / n;
+      }
+      sigN++;
     }
   });
   if (!values.length) return;
   // Smooth a little and normalise within the file
   const sm = values.map((v, i) => (values[i - 1] ?? v) * 0.25 + v * 0.5 + (values[i + 1] ?? v) * 0.25);
   const lo = Math.min(...sm), hi = Math.max(...sm);
-  m.scores = { step, values: hi - lo > 1e-3 ? sm.map(v => (v - lo) / (hi - lo)) : sm.map(() => 0.5) };
+  m.scores = { step, values: hi - lo > 1e-3 ? sm.map(v => (v - lo) / (hi - lo)) : sm.map(() => 0.5), sig: sigN ? sig.map(v => v / sigN / 255) : null };
   save();
 }
 function queueAnalysis(list) {
@@ -1227,6 +1238,13 @@ async function ensureAnalyzed(maxWaitMs = 120000) {
   }
   return !pending().length;
 }
+/* 0 = looks different, 1 = looks the same (coarse brightness layout of the whole file). */
+function sceneSimilarity(a, b) {
+  const sa = a.scores && a.scores.sig, sb = b.scores && b.scores.sig;
+  if (!sa || !sb) return 0;
+  let d = 0; for (let i = 0; i < 16; i++) d += Math.abs(sa[i] - sb[i]);
+  return clamp(1 - (d / 16) / 0.12, 0, 1);   // avg difference of 12% brightness or more = different scenes
+}
 /* Average interest of the window [s, s+len] of a video (0.5 when unknown). */
 function windowScore(m, s, len) {
   const sc = m.scores; if (!sc) return 0.5;
@@ -1239,19 +1257,34 @@ function pickWindows(m, k, len) {
   const dur = m.duration;
   if (len >= dur - 0.05) return [[0, dur]];
   const margin = Math.min(dur * 0.04, 0.75);
+  const lo = margin, hi = dur - margin;
   const cands = [];
-  for (let s = margin; s + len <= dur - margin + 1e-6; s += 0.25) cands.push({ s, base: windowScore(m, s, len) });
+  for (let st = lo; st + len <= hi + 1e-6; st += 0.25) cands.push({ s: st, base: windowScore(m, st, len) });
   if (!cands.length) cands.push({ s: 0, base: 0.5 });
   const chosen = [];
-  for (let i = 0; i < k; i++) {
+  const overlaps = (st) => chosen.some(w => st < w[1] + 0.5 && st + len > w[0] - 0.5);
+  // Split the file into k zones and take the best window inside each zone, so every pick comes
+  // from a different section of the recording (no two picks of the same scene).
+  const zone = (hi - lo) / k;
+  for (let z = 0; z < k; z++) {
+    const z0 = lo + z * zone, z1 = lo + (z + 1) * zone;
     let best = null, bestV = -1;
     for (const c of cands) {
-      if (chosen.some(w => c.s < w[1] + 0.5 && c.s + len > w[0] - 0.5)) continue;   // never the same footage twice
-      // prefer moments far from already chosen ones, and (slightly) not the very start
+      if (c.s < z0 - 1e-6 || c.s + len > z1 + 1e-6) continue;
+      if (overlaps(c.s)) continue;
       let v = c.base;
-      chosen.forEach(w => { const dist = Math.abs(c.s - w[0]); v *= Math.min(1, 0.55 + dist / Math.max(1, dur) ); });
+      const centre = (z0 + z1) / 2 - len / 2;
+      v *= 1 - 0.15 * Math.min(1, Math.abs(c.s - centre) / Math.max(0.5, zone)); // mild preference for the zone middle
       if (c.s < 0.5) v *= 0.9;
       if (v > bestV) { bestV = v; best = c; }
+    }
+    if (!best) {
+      // Zone too short for a full window: take the best non-overlapping window anywhere, farthest from the others.
+      for (const c of cands) {
+        if (overlaps(c.s)) continue;
+        let v = c.base; chosen.forEach(w => { v *= Math.min(1, 0.4 + Math.abs(c.s - w[0]) / Math.max(1, dur)); });
+        if (v > bestV) { bestV = v; best = c; }
+      }
     }
     if (!best) break;
     chosen.push([best.s, best.s + len]);
@@ -1309,7 +1342,18 @@ function planEdit(target) {
     const probeLen = Math.max(AUTO_MIN_CLIP, Math.min(pace, 6));
     const ranked = videos.map((m, i) => ({ m, i, v: m.scores ? Math.max(...pickWindows(m, 1, Math.min(probeLen, m.duration)).map(w => windowScore(m, w[0], w[1] - w[0]))) : 0.5 + (i % 2) * 0.01 }));
     const anyScores = videos.some(m => m.scores);
-    const keep = anyScores ? ranked.sort((a, b) => b.v - a.v).slice(0, videoSlots).sort((a, b) => a.i - b.i).map(r => r.m) : pickEvenly(videos, videoSlots);
+    let keep;
+    if (anyScores) {
+      // Greedy: best moment first, then penalise files that look like an already chosen one.
+      const chosen = [];
+      const pool = ranked.slice();
+      while (chosen.length < videoSlots && pool.length) {
+        let bi = 0, bv = -1;
+        pool.forEach((r, idx) => { const sim = chosen.reduce((mx, c) => Math.max(mx, sceneSimilarity(r.m, c.m)), 0); const v = r.v * (1 - 0.7 * sim); if (v > bv) { bv = v; bi = idx; } });
+        chosen.push(pool.splice(bi, 1)[0]);
+      }
+      keep = chosen.sort((a, b) => a.i - b.i).map(r => r.m);
+    } else keep = pickEvenly(videos, videoSlots);
     videos = keep;
   }
   const totalSrc = videos.reduce((a, m) => a + m.duration, 0);
@@ -2442,6 +2486,26 @@ function renderMediaGrid() {
    UI – timeline
    ====================================================================== */
 let dragId = null;
+const stripQueue = new Set();
+let stripRunning = false;
+/* Thumbnail for a clip: the filmstrip frame nearest to the clip's start (built lazily in the background). */
+function clipThumb(clip, m) {
+  if (clip.kind !== 'video' || !m.duration) return m.thumb;
+  if (m.strip && m.strip.length > 1) return m.strip[clamp(Math.floor(((clip.start + clip.end) / 2) / m.duration * m.strip.length), 0, m.strip.length - 1)];
+  if (!m.strip && !stripQueue.has(m.id)) { stripQueue.add(m.id); runStripQueue(); }
+  return m.thumb;
+}
+async function runStripQueue() {
+  if (stripRunning) return;
+  stripRunning = true;
+  while (stripQueue.size) {
+    const id = stripQueue.values().next().value; stripQueue.delete(id);
+    const m = state.media.get(id);
+    if (!m || m.strip) continue;
+    try { await buildStrip(m); if (!state.playing) renderTimeline(); } catch (e) {}
+  }
+  stripRunning = false;
+}
 function renderTimeline() {
   const z = state.tlZoom;
   const L = layout();
@@ -2478,7 +2542,7 @@ function renderTimeline() {
     const d = document.createElement('div');
     d.className = 'clip' + (clip.id === state.selectedId ? ' selected' : '');
     d.style.width = `${Math.max(28, dur * z)}px`;
-    if (m) d.style.backgroundImage = `url(${m.thumb})`;
+    if (m) d.style.backgroundImage = `url(${clipThumb(clip, m)})`;
     d.draggable = true; d.dataset.id = clip.id;
     const badges = [];
     if (clip.speed !== 1) badges.push(`${clip.speed}×`);
@@ -2487,7 +2551,7 @@ function renderTimeline() {
     if (clip.volume === 0 && clip.kind === 'video') badges.push('🔇');
     d.innerHTML = (clip.transition.type !== 'none' ? '<div class="trans"></div>' : '') +
       `<div class="badges">${badges.map(b => `<span class="badge">${b}</span>`).join('')}</div>` +
-      `<div class="label">${clip.name} · ${fmt(dur)}</div>`;
+      `<div class="label">${clip.name}${clip.kind === 'video' ? ` @${fmt(clip.start).replace(/^00:/, '')}` : ''} · ${fmt(dur)}</div>`;
     d.addEventListener('click', (e) => {
       selectClip(clip.id);
       const rect = d.getBoundingClientRect();
