@@ -36,7 +36,7 @@ function toast(msg, ms = 2200) {
    State
    ====================================================================== */
 function newProject() {
-  return { title: '', aspect: '16:9', theme: 'classic', pace: 'medium', themeTitle: true, themeMusic: true, targetLength: 30, clips: [], music: null };
+  return { title: '', aspect: '16:9', theme: 'classic', pace: 'medium', themeTitle: true, themeMusic: true, targetLength: 30, prefs: { people: true, views: true, action: true }, clips: [], music: null };
 }
 function defaultClip(m) {
   return {
@@ -1178,7 +1178,7 @@ function frameFeatures(prevL) {
   if (mean < 28) score *= 0.45; else if (mean < 50) score *= 0.8;
   if (mean > 235) score *= 0.6;
   if (motion > 60) score *= 0.7;            // violent shake / whip pans
-  return { score, L };
+  return { score, L, motion };
 }
 /* 4x4 grid of mean R,G,B (48 values, 0..1) of whatever is on the probe canvas. */
 function cellSignature() {
@@ -1190,10 +1190,83 @@ function cellSignature() {
   }
   return sig.map((v, k) => v / cnt[Math.floor(k / 3)] / 255);
 }
+/* ---------- Face detector (face-api.js tiny model, self-hosted) ---------- */
+let faceApiState = 'idle';   // idle | loading | ready | failed
+const detectCanvas = document.createElement('canvas'); detectCanvas.width = 224; detectCanvas.height = 126;
+const detectCtx = detectCanvas.getContext('2d', { willReadFrequently: true });
+function loadScriptOnce(src) {
+  return new Promise((res, rej) => { const sc = document.createElement('script'); sc.src = src; sc.onload = res; sc.onerror = () => rej(new Error('failed to load ' + src)); document.head.appendChild(sc); });
+}
+async function ensureFaceApi() {
+  if (faceApiState === 'ready') return true;
+  if (faceApiState === 'failed') return false;
+  if (faceApiState === 'loading') { while (faceApiState === 'loading') await sleep(100); return faceApiState === 'ready'; }
+  faceApiState = 'loading';
+  try {
+    if (!window.faceapi) await loadScriptOnce('js/vendor/faceapi/face-api.min.js');
+    await window.faceapi.nets.tinyFaceDetector.loadFromUri('js/vendor/faceapi');
+    faceApiState = 'ready';
+  } catch (e) { console.info('face detector unavailable', e && e.message); exportDiag.push(`face detector unavailable: ${e && e.message}`); faceApiState = 'failed'; }
+  return faceApiState === 'ready';
+}
+/* 0..1: how much the frame is "about people" (bigger / more faces score higher). */
+async function peopleScore(source) {
+  if (faceApiState !== 'ready') return 0;
+  try {
+    detectCtx.drawImage(source, 0, 0, 224, 126);
+    const faces = await window.faceapi.detectAllFaces(detectCanvas, new window.faceapi.TinyFaceDetectorOptions({ inputSize: 224, scoreThreshold: 0.45 }));
+    if (!faces.length) return 0;
+    let area = 0; faces.forEach(f => { area += (f.box.width * f.box.height) / (224 * 126); });
+    return clamp(Math.sqrt(area) * 2.2 + 0.2 * Math.min(faces.length, 3), 0, 1);
+  } catch (e) { return 0; }
+}
+/* 0..1: "scenic view" look of the probe frame: saturated, sky above textured ground, steady camera. */
+function sceneryScore(L, motion) {
+  const d = probeCtx.getImageData(0, 0, 64, 36).data;
+  let sat = 0;
+  for (let i = 0; i < d.length; i += 4) { const mx = Math.max(d[i], d[i + 1], d[i + 2]), mn = Math.min(d[i], d[i + 1], d[i + 2]); sat += mx ? (mx - mn) / mx : 0; }
+  sat /= (d.length / 4);
+  let top = 0, bottom = 0, bottomSharp = 0;
+  for (let y = 0; y < 36; y++) for (let x = 0; x < 64; x++) {
+    const i = y * 64 + x;
+    if (y < 12) top += L[i]; else { bottom += L[i]; if (x < 63) bottomSharp += Math.abs(L[i + 1] - L[i]); }
+  }
+  top /= 12 * 64; bottom /= 24 * 64; bottomSharp /= 24 * 63;
+  const sky = clamp((top - bottom) / 70, 0, 1);
+  let s = 0.4 * clamp(sat / 0.35, 0, 1) + 0.35 * sky + 0.25 * clamp(bottomSharp / 16, 0, 1);
+  if (motion > 30) s *= 0.7;
+  return clamp(s, 0, 1);
+}
+/* Per-second loudness (0..1) when the file's audio can be decoded quickly; null otherwise. */
+async function loudnessCurve(m, step, count) {
+  try {
+    const buf = await getAudioBuffer(m.id, m.blob);
+    if (!buf) return null;
+    const sr = buf.sampleRate, ch = buf.numberOfChannels, out = [];
+    for (let i = 0; i < count; i++) {
+      const a = Math.floor(i * step * sr), b = Math.min(buf.length, Math.floor((i + 1) * step * sr));
+      let sum = 0, n = 0;
+      for (let c = 0; c < ch; c++) { const dta = buf.getChannelData(c); for (let k = a; k < b; k += 16) { sum += dta[k] * dta[k]; n++; } }
+      out.push(n ? Math.sqrt(sum / n) : 0);
+    }
+    const mx = Math.max(...out) || 1;
+    return out.map(v => v / mx);
+  } catch (e) { return null; }
+}
+function prefs() { const p = P().prefs || {}; return { people: p.people !== false, views: p.views !== false, action: p.action !== false }; }
+/* Combined interest of sample i under the current preferences. */
+function interestAt(sc, i) {
+  if (!sc.tech) return sc.values[i] ?? 0.5;
+  const pr = prefs();
+  let w = { tech: 0.15, people: pr.people ? 0.4 : 0, views: pr.views ? 0.25 : 0, action: pr.action ? 0.2 : 0 };
+  const tot = w.tech + w.people + w.views + w.action;
+  return (w.tech * sc.tech[i] + w.people * (sc.people[i] || 0) + w.views * sc.scenery[i] + w.action * sc.action[i]) / tot;
+}
 async function analyzeMedia(m) {
-  if (m.kind !== 'video' || (m.scores && m.scores.sig && m.scores.sig.length === 144) || m.duration < 1) return;
+  if (m.kind !== 'video' || (m.scores && m.scores.tech && m.scores.sig && m.scores.sig.length === 144) || m.duration < 1) return;
   const step = Math.max(1, m.duration / 24);
-  const values = [];
+  const faces = await ensureFaceApi();
+  const tech = [], people = [], scenery = [], motionArr = [];
   const sig = [new Array(48).fill(0), new Array(48).fill(0), new Array(48).fill(0)], sigN = [0, 0, 0];   // first / middle / last third
   await withScratch(async () => {
     await bind(scratch, m);
@@ -1201,25 +1274,35 @@ async function analyzeMedia(m) {
     let prevL = null;
     for (let t = step / 2; t < m.duration; t += step) {
       await seekTo(el, t); await waitFrame(el, 150);
-      try { probeCtx.drawImage(el, 0, 0, 64, 36); } catch (e) { values.push(0.5); continue; }
+      try { probeCtx.drawImage(el, 0, 0, 64, 36); } catch (e) { tech.push(0.5); people.push(0); scenery.push(0.3); motionArr.push(0); continue; }
       const f = frameFeatures(prevL);
-      values.push(f.score); prevL = f.L;
-      // 4x4 colour grid accumulated over the file = a coarse picture of what the scene looks like
+      const motion = prevL ? f.motion : 0;
+      tech.push(f.score); motionArr.push(motion);
+      scenery.push(sceneryScore(f.L, motion));
+      people.push(faces ? await peopleScore(el) : 0);
+      prevL = f.L;
       const cs = cellSignature();
       const third = Math.min(2, Math.floor(t / m.duration * 3));
       for (let k = 0; k < 48; k++) sig[third][k] += cs[k];
       sigN[third]++;
     }
   });
-  if (!values.length) return;
-  // Smooth a little and normalise within the file
-  const sm = values.map((v, i) => (values[i - 1] ?? v) * 0.25 + v * 0.5 + (values[i + 1] ?? v) * 0.25);
-  const lo = Math.min(...sm), hi = Math.max(...sm);
-  m.scores = { step, values: hi - lo > 1e-3 ? sm.map(v => (v - lo) / (hi - lo)) : sm.map(() => 0.5), sig: sigN.some(n => n) ? [0, 1, 2].flatMap(th => { const n = sigN[th] || sigN.find(x => x) || 1; const src = sigN[th] ? sig[th] : sig[sigN.findIndex(x => x)]; return src.map(v => v / n); }) : null };
+  if (!tech.length) return;
+  const loud = await loudnessCurve(m, step, tech.length);
+  const norm = (arr) => { const sm = arr.map((v, i) => (arr[i - 1] ?? v) * 0.25 + v * 0.5 + (arr[i + 1] ?? v) * 0.25); const lo = Math.min(...sm), hi = Math.max(...sm); return hi - lo > 1e-3 ? sm.map(v => (v - lo) / (hi - lo)) : sm.map(() => 0.5); };
+  const motionN = motionArr.map(v => clamp(v / 22, 0, 1));
+  const action = motionN.map((v, i) => loud ? 0.5 * v + 0.5 * loud[i] : v);
+  m.scores = {
+    step, tech: norm(tech), people: people.map(v => clamp(v, 0, 1)), scenery, action,
+    values: null,
+    hasFaces: faces, hasAudio: !!loud,
+    sig: sigN.some(n => n) ? [0, 1, 2].flatMap(th => { const n = sigN[th] || sigN.find(x => x) || 1; const src = sigN[th] ? sig[th] : sig[sigN.findIndex(x => x)]; return src.map(v => v / n); }) : null
+  };
+  m.scores.values = m.scores.tech.map((_, i) => interestAt(m.scores, i));
   save();
 }
 function queueAnalysis(list) {
-  const needs = (m) => m.kind === 'video' && !(m.scores && m.scores.sig && m.scores.sig.length === 144);
+  const needs = (m) => m.kind === 'video' && !(m.scores && m.scores.tech && m.scores.sig && m.scores.sig.length === 144);
   list.forEach(m => { if (needs(m) && !analysisQueue.includes(m)) analysisQueue.push(m); });
   analysisProgress.total += list.filter(needs).length;
   runAnalysis();
@@ -1238,7 +1321,7 @@ async function runAnalysis() {
 }
 /* Waits (with a progress toast) until every video in the bin has an interest curve. */
 async function ensureAnalyzed(maxWaitMs = 120000) {
-  const pending = () => Array.from(state.media.values()).filter(m => m.kind === 'video' && !(m.scores && m.scores.sig && m.scores.sig.length === 144));
+  const pending = () => Array.from(state.media.values()).filter(m => m.kind === 'video' && !(m.scores && m.scores.tech && m.scores.sig && m.scores.sig.length === 144));
   if (!pending().length) return true;
   queueAnalysis(pending());
   const t0 = performance.now();
@@ -1313,10 +1396,12 @@ function uniqueMedia(list, strict) {
 }
 /* Average interest of the window [s, s+len] of a video (0.5 when unknown). */
 function windowScore(m, s, len) {
-  const sc = m.scores; if (!sc) return 0.5;
-  let sum = 0, n = 0;
-  for (let i = 0; i < sc.values.length; i++) { const t = (i + 0.5) * sc.step; if (t >= s - 0.25 && t <= s + len + 0.25) { sum += sc.values[i]; n++; } }
-  return n ? sum / n : 0.5;
+  const sc = m.scores; if (!sc || !(sc.tech || sc.values)) return 0.5;
+  const count = (sc.tech || sc.values).length;
+  let sum = 0, n = 0, peak = 0;
+  for (let i = 0; i < count; i++) { const t = (i + 0.5) * sc.step; if (t >= s - 0.25 && t <= s + len + 0.25) { const v = interestAt(sc, i); sum += v; peak = Math.max(peak, v); n++; } }
+  if (!n) return 0.5;
+  return 0.7 * (sum / n) + 0.3 * peak;   // a strong moment inside the window counts
 }
 /* Picks k non-overlapping windows of length len in a video, best interest first, spread out. */
 function pickWindows(m, k, len) {
@@ -1418,33 +1503,44 @@ function planEdit(target) {
   if (images.length && images.length * imgDur > target * 0.4) imgDur = Math.max(2, target * 0.4 / images.length);
   const videoBudget = Math.max(0, target - images.length * imgDur);
   const videoSlots = Math.max(0, maxClips - images.length);
-  if (videos.length > videoSlots) {
-    // More files than slots: keep the files whose best moment scores highest, in original order.
-    const probeLen = Math.max(AUTO_MIN_CLIP, Math.min(pace, 6));
-    const ranked = videos.map((m, i) => ({ m, i, v: m.scores ? Math.max(...pickWindows(m, 1, Math.min(probeLen, m.duration)).map(w => windowScore(m, w[0], w[1] - w[0]))) : 0.5 + (i % 2) * 0.01 }));
-    const anyScores = videos.some(m => m.scores);
-    let keep;
-    if (anyScores) {
-      // Greedy: best moment first, then penalise files that look like an already chosen one.
-      const chosen = [];
-      const pool = ranked.slice();
-      while (chosen.length < videoSlots && pool.length) {
-        let bi = -1, bv = -1;
-        pool.forEach((r, idx) => {
-          const sim = chosen.reduce((mx, c) => Math.max(mx, sceneSimilarity(r.m, c.m)), 0);
-          if (sim >= 0.7) return;                      // same scene as one already chosen: skip
-          const v = r.v * (1 - 0.7 * sim); if (v > bv) { bv = v; bi = idx; }
-        });
-        if (bi < 0) break;                              // only look-alikes left: leave slots empty
-        chosen.push(pool.splice(bi, 1)[0]);
+  const videoClips = [];
+  const totalSrcAll = videos.reduce((a, m) => a + m.duration, 0);
+  if (videos.length && videoSlots > 0 && totalSrcAll > videoBudget * 1.02) {
+    // Global pick: every file offers candidate windows; the best moments win wherever they are,
+    // a strong file may give several clips (from different parts), look-alike files are skipped.
+    const len = clamp(videoBudget / videoSlots, AUTO_MIN_CLIP, 8);
+    const cands = [];
+    videos.forEach((m, fi) => {
+      const L = Math.min(len, m.duration);
+      const margin = Math.min(m.duration * 0.04, 0.75);
+      if (m.duration <= L + 0.05) { cands.push({ m, fi, s: 0, len: m.duration, v: windowScore(m, 0, m.duration) }); return; }
+      for (let st = margin; st + L <= m.duration - margin + 1e-6; st += 0.5) cands.push({ m, fi, s: st, len: L, v: windowScore(m, st, L) });
+    });
+    const chosen = [];
+    const perFile = new Map();
+    // Pass 1 keeps picks from one file well apart (different sections); later passes relax the
+    // spacing (never the overlap) so long files can still fill the remaining slots.
+    for (const gap of [Math.max(1, len * 0.5), 0.75, 0.3]) {
+      while (chosen.length < videoSlots) {
+        let best = null, bestV = -1;
+        for (const c of cands) {
+          if (chosen.some(w => w.m === c.m && c.s < w.s + w.len + gap && c.s + c.len > w.s - gap)) continue;   // never the same footage
+          const used = perFile.get(c.m.id) || 0;
+          const sim = chosen.reduce((mx, w) => w.m === c.m ? mx : Math.max(mx, sceneSimilarity(c.m, w.m)), 0);
+          if (sim >= 0.7) continue;                        // looks like a scene already in the video
+          const v = c.v * Math.pow(0.8, used) * (1 - 0.6 * sim);
+          if (v > bestV) { bestV = v; best = c; }
+        }
+        if (!best) break;
+        chosen.push(best); perFile.set(best.m.id, (perFile.get(best.m.id) || 0) + 1);
       }
-      keep = chosen.sort((a, b) => a.i - b.i).map(r => r.m);
-    } else keep = pickEvenly(videos, videoSlots);
-    videos = keep;
+      if (chosen.length >= videoSlots) break;
+    }
+    chosen.sort((a, b) => a.fi - b.fi || a.s - b.s);   // keep the story in shooting order
+    chosen.forEach(w => { const c = defaultClip(w.m); c.start = w.s; c.end = Math.min(w.m.duration, w.s + w.len); videoClips.push(c); });
   }
   const totalSrc = videos.reduce((a, m) => a + m.duration, 0);
-  const videoClips = [];
-  if (videos.length && videoSlots > 0) {
+  if (videos.length && videoSlots > 0 && !videoClips.length) {
     if (totalSrc <= videoBudget * 1.02) {
       // Less footage than the target: use everything, cut into pace-sized pieces for rhythm.
       videos.forEach(m => {
@@ -2370,7 +2466,17 @@ function diagnosticsText() {
   state.media.forEach(m => lines.push(`${m.kind} ${m.name} ${m.kind === 'video' ? fmt(m.duration) : ''} ${m.w}x${m.h} ${(m.blob && m.blob.size / 1e6).toFixed(1)}MB analysed:${!!(m.scores && m.scores.sig)}`));
   const dups = findDuplicateMedia(); if (dups.length) lines.push(`duplicate groups: ${dups.map(g => `${g.keep.name} x${g.dupes.length + 1}`).join(', ')}`);
   lines.push('', `== Timeline (${P().clips.length} clips, ${fmt(totalDuration())}, target ${P().targetLength}, theme ${P().theme}, pace ${P().pace}) ==`);
-  layout().forEach(({ clip, offset, dur }) => lines.push(`${fmt(offset)} ${clip.kind} ${clip.name}${clip.kind === 'video' ? ` src ${clip.start.toFixed(2)}-${clip.end.toFixed(2)}` : ''} len ${dur.toFixed(2)} x${clip.speed} ${clip.filter.preset} ${clip.transition.type}`));
+  layout().forEach(({ clip, offset, dur }) => {
+    let why = '';
+    const m = state.media.get(clip.mediaId);
+    if (clip.kind === 'video' && m && m.scores && m.scores.tech) {
+      const sc = m.scores; const idx = []; for (let i = 0; i < sc.tech.length; i++) { const t = (i + 0.5) * sc.step; if (t >= clip.start && t <= clip.end) idx.push(i); }
+      const avg = (arr) => idx.length ? (idx.reduce((a, i) => a + (arr[i] || 0), 0) / idx.length).toFixed(2) : '?';
+      why = ` people ${avg(sc.people)} views ${avg(sc.scenery)} action ${avg(sc.action)} tech ${avg(sc.tech)}`;
+    }
+    lines.push(`${fmt(offset)} ${clip.kind} ${clip.name}${clip.kind === 'video' ? ` src ${clip.start.toFixed(2)}-${clip.end.toFixed(2)}` : ''} len ${dur.toFixed(2)}${why}`);
+  });
+  lines.push(`face detector: ${faceApiState}; prefs ${JSON.stringify(prefs())}`);
   const byFile = {}; P().clips.forEach(c => { byFile[c.name] = (byFile[c.name] || 0) + 1; });
   lines.push('', 'clips per file: ' + Object.entries(byFile).map(([k, v]) => `${k}:${v}`).join(', '));
   return lines.join('\n');
@@ -2761,6 +2867,7 @@ function renderInspector() {
   setSeg('paceSeg', 'pace', P().pace);
   $('#themeTitle').checked = !!P().themeTitle;
   $('#themeMusic').checked = P().themeMusic !== false;
+  const pr = prefs(); $('#prefPeople').checked = pr.people; $('#prefViews').checked = pr.views; $('#prefAction').checked = pr.action;
   renderLengthControl();
   renderMusicPanel();
   $('#projectTitle').value = P().title; $('#projectTitleMobile').value = P().title;
@@ -3102,6 +3209,7 @@ function bindUI() {
   });
   $('#themeTitle').addEventListener('change', (e) => { P().themeTitle = e.target.checked; save(); });
   $('#themeMusic').addEventListener('change', (e) => { P().themeMusic = e.target.checked; save(); });
+  [['#prefPeople', 'people'], ['#prefViews', 'views'], ['#prefAction', 'action']].forEach(([sel, key]) => $(sel).addEventListener('change', (e) => { P().prefs = { ...prefs(), [key]: e.target.checked }; save(); }));
   $('#applyThemeBtn').addEventListener('click', () => { if (!P().clips.length) { toast('Add clips first'); return; } pause(); pushUndo(); applyTheme({ retrim: false }); renderAll(); save(); toast(`${THEMES[P().theme].name} theme applied`); });
   $('#shuffleBtn').addEventListener('click', () => { pause(); shuffleClips(); });
 
@@ -3180,5 +3288,5 @@ window.addEventListener('error', (e) => { if (e && e.message) toast(`Error: ${e.
 window.addEventListener('unhandledrejection', (e) => { const r = e && e.reason; toast(`Error: ${r && r.message ? r.message : r}`, 6000); });
 
 /* Exposed for debugging / tests */
-window.QuikWeb = { findDuplicateMedia, removeDuplicateMedia, diagnosticsText, ensureAnalyzed, pickWindows, dedupeClips, uniqueMedia, sceneSimilarity, HAS_WEBCODECS, startOfflineExport, audioFallback, setExportMode: (m) => { exportMode = m; }, audioBufferCache, normalizeAacDescription, aacLcConfig, players, scratch, planEdit, fitToLength, targetSeconds, state, importFiles, addToTimeline, autoCreate, applyTheme, beatSync, play, pause, setPlayhead, renderAt, totalDuration, layout, setMusic, splitAtPlayhead, startExport, pickMime, useLibraryTrack, loadLibrary };
+window.QuikWeb = { ensureFaceApi, peopleScore, faceApiState: () => faceApiState, findDuplicateMedia, removeDuplicateMedia, diagnosticsText, ensureAnalyzed, pickWindows, dedupeClips, uniqueMedia, sceneSimilarity, HAS_WEBCODECS, startOfflineExport, audioFallback, setExportMode: (m) => { exportMode = m; }, audioBufferCache, normalizeAacDescription, aacLcConfig, players, scratch, planEdit, fitToLength, targetSeconds, state, importFiles, addToTimeline, autoCreate, applyTheme, beatSync, play, pause, setPlayhead, renderAt, totalDuration, layout, setMusic, splitAtPlayhead, startExport, pickMime, useLibraryTrack, loadLibrary };
 })();

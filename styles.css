@@ -110,6 +110,8 @@ button:disabled { opacity: 0.5; cursor: default; filter: none; }
 .field-label span { color: var(--text); float: right; }
 .field-row { display: flex; gap: 8px; align-items: center; margin: 8px 0; }
 .clip-name { font-weight: 600; word-break: break-all; }
+.prefs { gap: 14px; }
+.prefs .check { margin: 0; }
 .check { display: flex; gap: 8px; align-items: center; margin: 8px 0; font-size: 13px; }
 .check input { accent-color: var(--accent); }
 
