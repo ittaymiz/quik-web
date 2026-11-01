@@ -340,15 +340,11 @@
   <div id="exportDialog" class="modal" hidden>
     <div class="modal-card">
       <h3>Export video</h3>
-      <label class="field-label">Resolution</label>
-      <select id="exportRes">
-        <option value="720">720p</option>
-        <option value="1080" selected>1080p</option>
-      </select>
-      <label class="field-label">Frame rate</label>
-      <select id="exportFps">
-        <option value="30" selected>30 fps</option>
-        <option value="60">60 fps</option>
+      <label class="field-label">Quality</label>
+      <select id="exportQuality">
+        <option value="share" selected>Share – fast, 720p · 30 fps (WhatsApp, Instagram)</option>
+        <option value="high">High – 1080p · 30 fps</option>
+        <option value="max">Max – 1080p · 60 fps (slowest)</option>
       </select>
       <p class="small-text muted" id="exportHint">The video is rendered frame by frame at full quality, with a clean audio mix. A 1‑minute video takes a minute or two. Keep the app open while it renders.</p>
       <div id="exportProgressWrap" hidden>

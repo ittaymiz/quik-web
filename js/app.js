@@ -1515,13 +1515,15 @@ async function decodeViaMediabunny(blob) {
 }
 async function getAudioBuffer(key, blob) {
   if (audioBufferCache.has(key)) return audioBufferCache.get(key);
+  if (audioFallback.capture && !key.startsWith('music')) return null;   // test hook: force live capture
   let buf = null, info = 'decoded';
-  if (!audioFallback.decode) { try { buf = await decodeViaWebAudio(blob); } catch (e) { buf = null; } }
+  let why = '';
+  if (!audioFallback.decode) { try { buf = await decodeViaWebAudio(blob); } catch (e) { buf = null; why = `decodeAudioData: ${e && e.message || e}`; } }
   if (!buf) {
     const r = await decodeViaMediabunny(blob);
     if (r && r.buffer) { buf = r.buffer; info = 'decoded (mediabunny)'; }
     else if (r && r.none) { info = 'no audio track'; audioBufferCache.set(key, null); audioNoTrack.add(key); return null; }
-    else info = 'undecodable';
+    else { info = 'undecodable'; exportDiag.push(`${key.startsWith('music') ? 'music' : 'clip'} undecodable (${why || 'mediabunny: ' + (MB() ? (typeof AudioDecoder === 'undefined' ? 'no AudioDecoder' : 'cannot decode') : 'not loaded')}) → live capture`); }
   }
   console.info('audio', key, info);
   audioBufferCache.set(key, buf);
@@ -1546,8 +1548,11 @@ async function captureElementAudio(m, start, end, speed, onProgress) {
     L.push(new Float32Array(ib.getChannelData(0)));
     R.push(new Float32Array(ib.getChannelData(Math.min(1, ib.numberOfChannels - 1))));
   };
-  const expected = Math.max(0.05, (end - start) / Math.max(0.0625, speed));
-  el.muted = false; el.playbackRate = clamp(speed, 0.0625, 16);
+  const CAP_RATE = 2;   // capture twice as fast with pitch correction off; the mix plays it back at half rate
+  const expected = Math.max(0.05, (end - start) / Math.max(0.0625, speed * CAP_RATE));
+  el.muted = false;
+  try { el.preservesPitch = false; } catch (e) {}
+  el.playbackRate = clamp(speed * CAP_RATE, 0.0625, 16);
   await seekTo(el, start);
   await new Promise((res) => {
     let finished = false;
@@ -1558,6 +1563,7 @@ async function captureElementAudio(m, start, end, speed, onProgress) {
     el.play().catch(() => done());
   });
   el.muted = true;
+  try { el.preservesPitch = true; } catch (e) {}
   try { capSrc.disconnect(proc); proc.disconnect(); mute.disconnect(); } catch (e) {}
   const n = L.reduce((a, c) => a + c.length, 0);
   if (!n) return null;
@@ -1596,7 +1602,7 @@ async function renderAudioOffline(total, onStatus, sr = 48000) {
       // Could not decode the file: capture this segment live (takes as long as the segment).
       const cap = await captureElementAudio(m, clip.start, clip.end, clip.speed, (p) => onStatus && onStatus(`Capturing audio ${i + 1}/${items.length} · ${Math.round(p * 100)}%`));
       if (!cap) continue;
-      src = octx.createBufferSource(); src.buffer = cap;
+      src = octx.createBufferSource(); src.buffer = cap; src.playbackRate.value = 0.5;   // undo the 2x capture
       captured++;
     } else continue;
     const g = octx.createGain();
@@ -1605,7 +1611,7 @@ async function renderAudioOffline(total, onStatus, sr = 48000) {
     g.gain.setValueAtTime(v, offset + d - edge); g.gain.linearRampToValueAtTime(0, offset + d);
     src.connect(g).connect(octx.destination);
     if (buf) src.start(offset, Math.min(clip.start, Math.max(0, buf.duration - 0.01)), Math.max(0.01, clip.end - clip.start));
-    else src.start(offset, 0, d);
+    else src.start(offset, 0, d / 2);
     any = true;
   }
   const mus = P().music;
@@ -1683,6 +1689,73 @@ async function encodeAudio(buffer, enc) {
   }
   await enc.flush();
 }
+/* ---------- Fast frame source: hardware decoding through mediabunny (no per-frame seeking) ---------- */
+const frameSources = new Map();   // mediaId -> source | null
+async function getFrameSource(m) {
+  if (frameSources.has(m.id)) return frameSources.get(m.id);
+  let src = null;
+  const mb = MB();
+  if (mb && !exportDiag.noFastFrames) {
+    let input = null;
+    try {
+      input = new mb.Input({ source: new mb.BlobSource(m.blob), formats: mb.ALL_FORMATS });
+      const track = await input.getPrimaryVideoTrack();
+      if (track && await track.canDecode()) {
+        const scale = Math.min(1, Math.max(W, H) * 1.0 / Math.max(m.w, m.h));
+        const sink = new mb.CanvasSink(track, { width: Math.max(2, Math.round(m.w * scale)), height: Math.max(2, Math.round(m.h * scale)), fit: 'fill', poolSize: 3 });
+        src = {
+          input, sink, iter: null, cur: null, nxt: null, done: true, lastT: -1,
+          async restart(st) {
+            if (this.iter) { try { await this.iter.return(); } catch (e) {} }
+            this.iter = this.sink.canvases(Math.max(0, st)); this.cur = null; this.nxt = null; this.done = false; this.lastT = st;
+          },
+          async frameAt(st) {
+            if (!this.iter || st < this.lastT - 0.001) await this.restart(st);
+            this.lastT = st;
+            while (!this.done && (this.nxt === null || this.nxt.timestamp <= st + 1e-4)) {
+              if (this.nxt) this.cur = this.nxt;
+              const r = await this.iter.next();
+              if (r.done) { this.done = true; this.nxt = null; break; }
+              this.nxt = r.value;
+              if (!this.cur) this.cur = this.nxt;
+            }
+            return this.cur ? this.cur.canvas : null;
+          },
+          async lastFrame(t) {
+            let last = null;
+            try { for await (const c of this.sink.canvases(Math.max(0, t - 0.5), t)) last = c; } catch (e) {}
+            if (!last) { await this.restart(Math.max(0, t - 0.1)); return await this.frameAt(t); }
+            return last.canvas;
+          },
+          close() { try { this.iter && this.iter.return(); } catch (e) {} try { input.dispose && input.dispose(); } catch (e) {} }
+        };
+      } else { exportDiag.push(`fast frames: ${track ? 'decoder unsupported' : 'no video track'} for ${m.name}`); try { input.dispose && input.dispose(); } catch (e) {} }
+    } catch (e) { exportDiag.push(`fast frames failed: ${e && e.message}`); try { input && input.dispose && input.dispose(); } catch (x) {} src = null; }
+  }
+  frameSources.set(m.id, src);
+  return src;
+}
+function closeFrameSources() { frameSources.forEach(s => { if (s) s.close(); }); frameSources.clear(); }
+/* Final frame of a clip for transitions during export (never touches the scratch element,
+   which may be busy capturing audio). */
+async function renderClipLastFrameExport(clip, idx) {
+  const m = state.media.get(clip.mediaId);
+  if (!m) return null;
+  const dur = clipDuration(clip);
+  let el = m.el;
+  if (clip.kind === 'video') {
+    const fs = await getFrameSource(m);
+    el = fs ? await fs.lastFrame(clip.end - 0.03) : null;
+    if (!el) { const p = playerForIdx(idx); await bind(p, m); await seekTo(p.el, clip.end - 0.03); await waitFrame(p.el, 150); el = p.el; }
+  }
+  const saved = snapshotCanvas();
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
+  drawSource(clip, m, el, dur, dur);
+  drawText(clip, dur, dur);
+  const out = snapshotCanvas();
+  ctx.drawImage(saved, 0, 0);
+  return out;
+}
 async function renderFrameOffline(t, cs) {
   const loc = locate(t);
   if (!loc) { drawFrameNow(null); return; }
@@ -1690,31 +1763,42 @@ async function renderFrameOffline(t, cs) {
     if (loc.idx > 0 && loc.clip.transition.type !== 'none') {
       const prev = P().clips[loc.idx - 1];
       const have = state.snapCache.get(prev.id);
-      if (!have || have.width !== W || have.height !== H) { const c = await renderClipLastFrame(prev); if (c) state.snapCache.set(prev.id, c); }
+      if (!have || have.width !== W || have.height !== H) { const c = await renderClipLastFrameExport(prev, loc.idx - 1); if (c) state.snapCache.set(prev.id, c); }
     }
-    cs.idx = loc.idx;
+    cs.idx = loc.idx; cs.fresh = true;
   }
   const m = state.media.get(loc.clip.mediaId);
+  let img = null;
   if (loc.clip.kind === 'video' && m) {
     const st = loc.clip.start + loc.lt * loc.clip.speed;
-    const p = playerForIdx(loc.idx);
-    await bind(p, m);
-    await seekTo(p.el, st);
-    await waitFrame(p.el, 200);
+    const fs = await getFrameSource(m);
+    if (fs) { if (cs.fresh) await fs.restart(st); img = await fs.frameAt(st); }
+    if (!img) {
+      const p = playerForIdx(loc.idx);
+      await bind(p, m);
+      await seekTo(p.el, st);
+      await waitFrame(p.el, 150);
+    }
   }
-  drawFrameNow(loc);
+  cs.fresh = false;
+  drawFrameNow(loc, img);
 }
 function setExportStatus(p, text) {
   $('#exportProgress').style.width = `${Math.round(p * 100)}%`;
   $('#exportStatus').textContent = text;
 }
+const exportDiag = [];
+exportDiag.push = function (msg) { if (this.length < 12) Array.prototype.push.call(this, msg); console.info('[export]', msg); };
+const QUALITY = { share: { res: 1280, fps: 30, bitrate: 4e6, label: '720p' }, high: { res: 1920, fps: 30, bitrate: 10e6, label: '1080p' }, max: { res: 1920, fps: 60, bitrate: 14e6, label: '1080p60' } };
+
 /* @returns true when the file was produced (or cancelled), false to fall back to MediaRecorder. */
-async function startOfflineExport(res, fps) {
+async function startOfflineExport(q) {
   if (!HAS_WEBCODECS) return false;
-  const bitrate = res >= 1920 ? 12e6 : 6e6;
+  const { res, fps, bitrate } = QUALITY[q] || QUALITY.share;
   pause();
   setCanvasSize(res);
   state.snapCache.clear();
+  exportDiag.length = 0;
   const total = totalDuration();
   const frames = Math.max(1, Math.ceil(total * fps));
   const vcodec = await pickVideoCodec(W, H, fps, bitrate);
@@ -1724,45 +1808,41 @@ async function startOfflineExport(res, fps) {
   keepAwake(true);
   $('#exportProgressWrap').hidden = false; $('#exportResult').hidden = true; $('#exportStartBtn').disabled = true;
   let venc = null, aenc = null, err = null;
+  let audioStatus = 'Preparing audio…', videoStatus = '';
+  const show = (p) => setExportStatus(p, [videoStatus, audioStatus].filter(Boolean).join('  ·  '));
   try {
-    // ---- 1. Audio first: mix, then encode (WebCodecs AAC/Opus, or the recorder + demux fallback)
-    setExportStatus(0.01, 'Preparing audio…');
-    const mix = await renderAudioOffline(total, (txt) => setExportStatus(0.02, txt));
-    if (offline.cancelled) throw new Error('cancelled');
-    let audioTrack = null;       // { codec, sampleRate, channels, add: (muxer) => void, label }
-    if (mix.buffer) {
+    // ---- Audio pipeline runs in parallel with the video rendering.
+    const audioPromise = (async () => {
+      const mix = await renderAudioOffline(total, (txt) => { audioStatus = txt; });
+      if (offline.cancelled || !mix.buffer) { audioStatus = mix.buffer ? '' : `no audio (${mix.notes.join(', ')})`; return { mix, track: null }; }
       const acodec = audioFallback.encode ? null : await pickAudioCodec(48000);
       if (acodec) {
-        setExportStatus(0.04, 'Encoding audio…');
+        audioStatus = 'Encoding audio…';
         const chunks = [];
         aenc = new AudioEncoder({ output: (c, m) => chunks.push([c, m]), error: (e) => { err = e; } });
         aenc.configure(acodec.cfg);
         await encodeAudio(mix.buffer, aenc);
         aenc.close(); aenc = null;
-        if (err) throw err;
-        audioTrack = { codec: acodec.mux, sampleRate: 48000, channels: 2, label: acodec.mux.toUpperCase(), add: (mx) => chunks.forEach(([c, m]) => mx.addAudioChunk(c, m)) };
-      } else {
-        const r = await encodeMixWithRecorder(mix.buffer, (txt) => setExportStatus(0.04, txt));
-        if (offline.cancelled) throw new Error('cancelled');
-        if (r && r.packets.length) {
-          audioTrack = { codec: r.codec, sampleRate: r.sampleRate, channels: r.channels, label: r.codec.toUpperCase() + ' (recorder)',
-            add: (mx) => r.packets.forEach((pk, i) => mx.addAudioChunkRaw(pk.data, pk.type, Math.round(pk.timestamp * 1e6), Math.round(pk.duration * 1e6), i === 0 ? { decoderConfig: r.decoderConfig } : undefined)) };
-        } else mix.notes.push('audio could not be encoded in this browser');
+        audioStatus = 'Audio ready';
+        return { mix, track: { codec: acodec.mux, sampleRate: 48000, channels: 2, label: acodec.mux.toUpperCase(), add: (mx) => chunks.forEach(([c, m]) => mx.addAudioChunk(c, m)) } };
       }
-    }
-    // ---- 2. Muxer with the final track layout
-    const target = new Mp4Muxer.ArrayBufferTarget();
-    const muxer = new Mp4Muxer.Muxer({
-      target,
-      video: { codec: vcodec.mux, width: W, height: H, frameRate: fps },
-      audio: audioTrack ? { codec: audioTrack.codec, sampleRate: audioTrack.sampleRate, numberOfChannels: audioTrack.channels } : undefined,
-      fastStart: 'in-memory', firstTimestampBehavior: 'offset'
-    });
-    if (audioTrack) audioTrack.add(muxer);
-    // ---- 3. Video, frame by frame
-    venc = new VideoEncoder({ output: (c, m) => muxer.addVideoChunk(c, m), error: (e) => { err = e; } });
+      exportDiag.push('AudioEncoder unavailable; using the recorder');
+      const r = await encodeMixWithRecorder(mix.buffer, (txt) => { audioStatus = txt; });
+      if (r && r.packets.length) {
+        audioStatus = 'Audio ready';
+        return { mix, track: { codec: r.codec, sampleRate: r.sampleRate, channels: r.channels, label: r.codec.toUpperCase() + ' (recorder)',
+          add: (mx) => r.packets.forEach((pk, i) => mx.addAudioChunkRaw(pk.data, pk.type, Math.round(pk.timestamp * 1e6), Math.round(pk.duration * 1e6), i === 0 ? { decoderConfig: r.decoderConfig } : undefined)) } };
+      }
+      mix.notes.push('audio could not be encoded in this browser');
+      audioStatus = 'no audio (encoder unavailable)';
+      return { mix, track: null };
+    })().catch(e => { exportDiag.push(`audio failed: ${e && e.message}`); audioStatus = 'no audio (failed)'; return { mix: { notes: [String(e && e.message || e)] }, track: null }; });
+
+    // ---- Video: decode + render + encode, chunks kept in memory until the audio is ready.
+    const vchunks = [];
+    venc = new VideoEncoder({ output: (c, m) => vchunks.push([c, m]), error: (e) => { err = e; } });
     venc.configure(vcodec.cfg);
-    const cs = { idx: -1 };
+    const cs = { idx: -1, fresh: true };
     const t0 = performance.now();
     for (let i = 0; i < frames; i++) {
       if (offline.cancelled) throw new Error('cancelled');
@@ -1775,17 +1855,32 @@ async function startOfflineExport(res, fps) {
       while (venc.encodeQueueSize > 4) await sleep(4);
       if (i % 5 === 0) {
         const el = (performance.now() - t0) / 1000, eta = el / (i + 1) * (frames - i - 1);
-        setExportStatus(0.08 + 0.9 * i / frames, `Rendering frame ${i + 1} of ${frames} · ${fmt(t)} / ${fmt(total)} · about ${Math.ceil(eta)}s left`);
+        videoStatus = `Video ${Math.round((i + 1) / frames * 100)}% · ${fmt(t)} / ${fmt(total)} · ~${Math.ceil(eta)}s left`;
+        show(0.03 + 0.9 * i / frames);
       }
     }
     await venc.flush(); venc.close(); venc = null;
+    videoStatus = 'Video ready';
+    show(0.94);
+    const { mix, track: audioTrack } = await audioPromise;
     if (offline.cancelled) throw new Error('cancelled');
-    setExportStatus(0.99, 'Writing file…');
+    // ---- Mux
+    setExportStatus(0.98, 'Writing file…');
+    const target = new Mp4Muxer.ArrayBufferTarget();
+    const muxer = new Mp4Muxer.Muxer({
+      target,
+      video: { codec: vcodec.mux, width: W, height: H, frameRate: fps },
+      audio: audioTrack ? { codec: audioTrack.codec, sampleRate: audioTrack.sampleRate, numberOfChannels: audioTrack.channels } : undefined,
+      fastStart: 'in-memory', firstTimestampBehavior: 'offset'
+    });
+    vchunks.forEach(([c, m]) => muxer.addVideoChunk(c, m));
+    if (audioTrack) audioTrack.add(muxer);
     muxer.finalize();
     const blob = new Blob([target.buffer], { type: 'video/mp4' });
-    const vLabel = vcodec.mux === 'avc' ? 'H.264' : vcodec.mux.toUpperCase();
-    const aLabel = audioTrack ? `${audioTrack.label} audio (${mix.notes.join(', ')})` : `no audio (${mix.notes.join(', ')})`;
-    showExportResult(blob, 'mp4', `${vLabel} · ${aLabel}`);
+    const secs = ((performance.now() - t0) / 1000).toFixed(0);
+    const vLabel = `${vcodec.mux === 'avc' ? 'H.264' : vcodec.mux.toUpperCase()} ${QUALITY[q] ? QUALITY[q].label : ''}`;
+    const aLabel = audioTrack ? `${audioTrack.label} audio (${(mix.notes || []).join(', ')})` : `no audio (${(mix.notes || []).join(', ')})`;
+    showExportResult(blob, 'mp4', `${vLabel} · ${aLabel} · ${secs}s` + (exportDiag.length ? ` · ${exportDiag.join('; ')}` : ''));
   } catch (e) {
     try { if (venc && venc.state !== 'closed') venc.close(); } catch (x) {}
     try { if (aenc && aenc.state !== 'closed') aenc.close(); } catch (x) {}
@@ -1801,6 +1896,7 @@ async function startOfflineExport(res, fps) {
 }
 function finishOffline() {
   state.exportingOffline = false;
+  closeFrameSources();
   offline = null;
   keepAwake(false);
   setCanvasSize(PREVIEW_LONG);
@@ -1889,11 +1985,11 @@ function unlockScratch() {
 }
 async function startExport() {
   unlockScratch();
-  const res = $('#exportRes').value === '1080' ? 1920 : 1280;
-  const fps = Number($('#exportFps').value) || 30;
+  const q = $('#exportQuality').value || 'share';
+  const { res, fps } = QUALITY[q] || QUALITY.share;
   if (state.exportingOffline || state.exporting) return;
   if (HAS_WEBCODECS) {
-    const done = await startOfflineExport(res, fps);
+    const done = await startOfflineExport(q);
     if (done) return;
   }
   startRecorderExport(res, fps);
