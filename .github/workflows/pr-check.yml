@@ -1,0 +1,48 @@
+# Runs on every pull request. Make this a required status check on `main`
+# (Settings → Rules → Rulesets) so a PR cannot be merged while it fails.
+name: PR check
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: JavaScript syntax
+        run: |
+          for f in js/app.js js/beats.js js/db.js js/presets.js sw.js; do
+            node --check "$f"
+          done
+      - name: JSON files parse
+        run: |
+          for f in manifest.webmanifest music/library.json js/vendor/faceapi/*.json; do
+            node -e "JSON.parse(require('fs').readFileSync('$f','utf8'))" && echo "ok $f"
+          done
+      - name: Every music track in library.json exists
+        run: |
+          node -e '
+            const lib = JSON.parse(require("fs").readFileSync("music/library.json","utf8"));
+            const tracks = Array.isArray(lib) ? lib : (lib.tracks || []);
+            let missing = 0;
+            for (const t of tracks) { if (!require("fs").existsSync(t.file)) { console.error("missing", t.file); missing++; } }
+            if (missing) process.exit(1);
+            console.log(tracks.length, "tracks ok");
+          '
+      - name: Precached files in sw.js exist
+        run: |
+          node -e '
+            const fs = require("fs");
+            const src = fs.readFileSync("sw.js","utf8");
+            const files = [...src.matchAll(/["\x27](\.\/[^"\x27]+)["\x27]/g)].map(m => m[1]).filter(f => f !== "./");
+            let missing = 0;
+            for (const f of files) { if (!fs.existsSync(f)) { console.error("missing", f); missing++; } }
+            if (missing) process.exit(1);
+            console.log(files.length, "precached files ok");
+          '
